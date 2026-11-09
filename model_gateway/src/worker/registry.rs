@@ -673,6 +673,26 @@ impl WorkerRegistry {
 
     /// Return a shared route-specific candidate snapshot for a model.
     ///
+    /// Whether a request for `model_id` drawn from `pool` can only reach a
+    /// provider's worker (an external runtime), the one kind that runs the
+    /// contract's hosted features: every worker of the model's pool is one,
+    /// and there is at least one. A pool that also holds an engine may land
+    /// the request on the engine, which drops the fields, so it does not
+    /// count. A model nobody lists reads the global pool, as the route
+    /// widens to the untagged workers.
+    pub(crate) fn pool_forwards_to_provider(&self, model_id: &str, pool: RoutingPool) -> bool {
+        let listed = self.get_routing_pool(model_id, pool);
+        let workers = if listed.is_empty() && model_id != UNKNOWN_MODEL_ID {
+            self.get_routing_pool(UNKNOWN_MODEL_ID, pool)
+        } else {
+            listed
+        };
+        !workers.is_empty()
+            && workers
+                .iter()
+                .all(|worker| worker.metadata().spec.runtime_type == RuntimeType::External)
+    }
+
     /// The first lookup after a membership change builds the projection once;
     /// subsequent requests only clone the outer `Arc`. Dynamic availability is
     /// intentionally checked by the policy so health, circuit-breaker and

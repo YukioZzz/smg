@@ -306,6 +306,16 @@ impl RouterTrait for ExternalRouterAdapter {
         self.inner.router_type()
     }
 
+    /// A request this adapter takes goes to its provider, which may run the
+    /// hosted features, as long as every HTTP worker of the model is a
+    /// provider's: a local engine registered under the provider mode is
+    /// selected like any other and runs none of them. The chat extractor
+    /// reads the answer through the gateway.
+    fn forwards_to_provider(&self, model_id: &str) -> bool {
+        self.worker_registry
+            .pool_forwards_to_provider(model_id, crate::worker::RoutingPool::HttpRegular)
+    }
+
     async fn health_generate(&self, req: Request<Body>) -> Response {
         self.inner.health_generate(req).await
     }
@@ -430,7 +440,10 @@ mod tests {
     use smg_external_router::spec_for_provider;
 
     use super::*;
-    use crate::middleware::{RouteRequestMeta, TenantKey};
+    use crate::{
+        middleware::{RouteRequestMeta, TenantKey},
+        worker::{test_support::no_health_check, BasicWorkerBuilder, WorkerType},
+    };
 
     /// A provider router of the kind the adapter mounts, keeping the
     /// Messages request it was handed as the JSON it would post: the trait's
@@ -496,5 +509,52 @@ mod tests {
         assert!(posted.get("rid").is_none(), "{posted}");
         assert_eq!(posted["model"], "m");
         assert_eq!(posted["messages"][0]["content"], "q");
+    }
+
+    /// A provider router of the kind the adapter mounts: the trait's two
+    /// required methods, every route its default.
+    #[derive(Debug)]
+    struct StubProvider;
+
+    #[async_trait]
+    impl ExternalRouter for StubProvider {
+        fn as_any(&self) -> &dyn Any {
+            self
+        }
+
+        fn router_type(&self) -> &'static str {
+            "stub"
+        }
+    }
+
+    /// The adapter forwards the hosted features: a request it takes goes to
+    /// a provider, as long as the model's HTTP pool is a provider's. An
+    /// empty registry forwards nothing; one untagged provider worker, the
+    /// keyless passthrough gateway's, forwards every model. The gateway's
+    /// selection reads this answer, so the chat extractor passes `store`
+    /// and `web_search_options` to a provider's model and refuses them on
+    /// an engine's.
+    #[test]
+    fn the_adapter_forwards_to_its_provider() {
+        let worker_registry = Arc::new(WorkerRegistry::new());
+        let adapter = ExternalRouterAdapter {
+            spec: spec_for_provider(None).expect("the OpenAI-compatible spec"),
+            inner: Arc::new(StubProvider),
+            rate_limit_manager: None,
+            worker_registry: worker_registry.clone(),
+        };
+        assert!(
+            !adapter.forwards_to_provider("sonar-pro"),
+            "an empty pool forwards nothing"
+        );
+        worker_registry.register_or_replace(Arc::new(
+            BasicWorkerBuilder::new("http://provider.invalid")
+                .worker_type(WorkerType::Regular)
+                .runtime_type(RuntimeType::External)
+                .health_config(no_health_check())
+                .build(),
+        ));
+        assert!(adapter.forwards_to_provider("sonar-pro"));
+        assert!(adapter.forwards_to_provider("any-model"));
     }
 }
