@@ -1,7 +1,10 @@
 //! The tokenizer management routes refuse in the control plane's envelope
 //! (`{"error", "code"}`, the shape the worker routes answer): an unknown
 //! tokenizer is a 404, a name in use a 409, a body the type does not take a
-//! 400. A loaded tokenizer keeps its answer shape.
+//! 400. A loaded tokenizer keeps its answer shape. The tokenize and detokenize
+//! routes refuse in the gateway's public envelope (`error.code`, `error.param`),
+//! as the model routes do: a body the type does not take is a 400, an unknown
+//! model a `404 model_not_found`.
 
 use std::sync::Arc;
 
@@ -116,4 +119,50 @@ async fn a_loaded_tokenizer_keeps_its_answer_shape() {
         serde_json::from_str(&text).unwrap_or_else(|e| panic!("not a TokenizerInfo ({e}): {text}"));
     assert_eq!(info.name, LOADED);
     assert_eq!(info.id, "tokenizer-id");
+}
+
+/// The public envelope of a refused request (`error.message`, `type`, `param`,
+/// `code`), or the panic names what the route answered.
+#[expect(
+    clippy::panic,
+    reason = "test helper: a body that is not the envelope is the finding, named with the body"
+)]
+fn public_envelope(text: &str) -> serde_json::Value {
+    let body: serde_json::Value = serde_json::from_str(text)
+        .unwrap_or_else(|e| panic!("not the public envelope ({e}): {text}"));
+    assert!(body["error"]["message"].is_string(), "{text}");
+    assert_eq!(body["error"]["type"], "invalid_request_error", "{text}");
+    body["error"].clone()
+}
+
+#[tokio::test]
+async fn a_tokenize_body_the_type_does_not_take_is_a_400_in_the_public_envelope() {
+    let app = app_with_a_loaded_tokenizer().await;
+    let without_prompt = format!(r#"{{"model":"{LOADED}"}}"#);
+    let (status, text) = send(&app, "POST", "/v1/tokenize", Some(&without_prompt)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    let error = public_envelope(&text);
+    assert_eq!(error["code"], "missing_required_parameter", "{text}");
+    assert_eq!(error["param"], "prompt", "{text}");
+
+    let unknown_model = r#"{"model":"no-such-model","prompt":"hello"}"#;
+    let (status, text) = send(&app, "POST", "/v1/tokenize", Some(unknown_model)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert_eq!(public_envelope(&text)["code"], "model_not_found", "{text}");
+}
+
+#[tokio::test]
+async fn a_detokenize_body_of_the_wrong_type_is_a_400_in_the_public_envelope() {
+    let app = app_with_a_loaded_tokenizer().await;
+    let words_for_ids = format!(r#"{{"model":"{LOADED}","tokens":["a"]}}"#);
+    let (status, text) = send(&app, "POST", "/v1/detokenize", Some(&words_for_ids)).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{text}");
+    let error = public_envelope(&text);
+    assert_eq!(error["code"], "invalid_type", "{text}");
+    assert_eq!(error["param"], "tokens", "{text}");
+
+    let unknown_model = r#"{"model":"no-such-model","tokens":[1,2]}"#;
+    let (status, text) = send(&app, "POST", "/v1/detokenize", Some(unknown_model)).await;
+    assert_eq!(status, StatusCode::NOT_FOUND, "{text}");
+    assert_eq!(public_envelope(&text)["code"], "model_not_found", "{text}");
 }

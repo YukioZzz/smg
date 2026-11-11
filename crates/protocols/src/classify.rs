@@ -8,16 +8,23 @@
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use validator::Validate;
 
-use super::common::{GenerationRequest, UsageInfo};
+use super::{
+    common::{GenerationRequest, UsageInfo},
+    validated::Normalizable,
+};
 
 // ============================================================================
 // Classify API
 // ============================================================================
 
-/// Classification request - compatible with the serving engine's /v1/classify API
+/// Classification request - compatible with the serving engine's /v1/classify API.
+/// It declares no validation rule: the validated extractor reads it for the
+/// gateway's error envelope on a body that does not parse or does not match
+/// the type.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct ClassifyRequest {
     /// ID of the model to use
     pub model: String,
@@ -37,6 +44,8 @@ pub struct ClassifyRequest {
     /// Engine extension: request priority
     pub priority: Option<i32>,
 }
+
+impl Normalizable for ClassifyRequest {}
 
 impl GenerationRequest for ClassifyRequest {
     fn rid(&self) -> Option<&str> {

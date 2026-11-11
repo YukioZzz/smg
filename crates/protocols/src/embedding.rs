@@ -1,14 +1,21 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use validator::Validate;
 
-use super::common::{GenerationRequest, UsageInfo};
+use super::{
+    common::{GenerationRequest, UsageInfo},
+    validated::Normalizable,
+};
 
 // ============================================================================
 // Embedding API
 // ============================================================================
 
+/// The body of `/v1/embeddings`. It declares no validation rule: the
+/// validated extractor reads it for the gateway's error envelope on a body
+/// that does not parse or does not match the type.
 #[serde_with::skip_serializing_none]
-#[derive(Debug, Clone, Deserialize, Serialize, schemars::JsonSchema)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, schemars::JsonSchema)]
 pub struct EmbeddingRequest {
     /// ID of the model to use
     pub model: String,
@@ -28,6 +35,8 @@ pub struct EmbeddingRequest {
     /// Engine extension: request id for tracking
     pub rid: Option<String>,
 }
+
+impl Normalizable for EmbeddingRequest {}
 
 impl GenerationRequest for EmbeddingRequest {
     fn rid(&self) -> Option<&str> {
