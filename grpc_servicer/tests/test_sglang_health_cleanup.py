@@ -19,7 +19,7 @@ def health_probe(monkeypatch, servicer_mod):
     manager = manager_mod.GrpcRequestManager.__new__(manager_mod.GrpcRequestManager)
     from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
 
-    manager.output_adapter = SchedulerOutputAdapter()
+    manager.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
     manager.gracefully_exit = False
     manager.is_pause = False
     manager.last_receive_tstamp = 0.0

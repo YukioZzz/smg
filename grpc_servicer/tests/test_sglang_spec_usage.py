@@ -20,7 +20,7 @@ def _manager(module, rids=("request",), stream=False):
     manager = module.GrpcRequestManager.__new__(module.GrpcRequestManager)
     from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
 
-    manager.output_adapter = SchedulerOutputAdapter()
+    manager.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
     manager.enable_trace = False  # Built without __init__; tracing is disabled.
     manager.metrics_collector = None  # Metrics are not under test.
     manager.rid_to_state = {

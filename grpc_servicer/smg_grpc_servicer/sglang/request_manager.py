@@ -245,7 +245,7 @@ class GrpcRequestManager:
 
         # State Management (from TokenizerManager)
         self.rid_to_state: dict[str, GrpcReqState] = {}
-        self.output_adapter = SchedulerOutputAdapter()
+        self.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
         self.asyncio_tasks: set = set()
         self.gracefully_exit = False
         self.no_create_loop = False

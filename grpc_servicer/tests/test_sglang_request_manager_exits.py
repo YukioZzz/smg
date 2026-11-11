@@ -121,7 +121,7 @@ def manager(monkeypatch):
     rm = module.GrpcRequestManager.__new__(module.GrpcRequestManager)
     from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
 
-    rm.output_adapter = SchedulerOutputAdapter()
+    rm.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
     rm.rid_to_state = {}
     rm.metrics_collector = None  # added field from PR; test fixture only
     rm.disaggregation_mode = "null"

@@ -86,7 +86,7 @@ def _manager_and_state(module, *, stream=False):
     manager = module.GrpcRequestManager.__new__(module.GrpcRequestManager)
     from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
 
-    manager.output_adapter = SchedulerOutputAdapter()
+    manager.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
     manager.enable_trace = False  # built without __init__: the tracing switch is off
     manager.metrics_collector = None
     state = module.GrpcReqState(

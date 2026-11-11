@@ -179,7 +179,7 @@ def _manager_and_state(module, collector=None):
     manager = module.GrpcRequestManager.__new__(module.GrpcRequestManager)
     from smg_grpc_servicer.sglang.compat import SchedulerOutputAdapter
 
-    manager.output_adapter = SchedulerOutputAdapter()
+    manager.output_adapter = SchedulerOutputAdapter(allow_empty_rows=True)
     manager.enable_trace = False  # target tracing field, fixture-only adaptation
     manager.metrics_collector = collector if collector is not None else Collector()
     manager.disaggregation_mode = "null"
@@ -587,5 +587,31 @@ def test_sparse_usage_is_removed_on_abort_and_late_output(manager_mod):
         manager.rid_to_state.clear()
         await manager._handle_batch_output(batch)  # state already removed
         assert not manager.output_adapter._counts
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("rows", [None, []])
+@pytest.mark.parametrize("counts", [None, [], [10]])
+def test_python_legacy_empty_rows_and_counts_preserve_defaults(manager_mod, rows, counts):
+    """Legacy optional columns still yield an empty token row and zero counts."""
+
+    async def scenario():
+        manager, state = _manager_and_state(manager_mod)
+        state.obj.return_logprob = False
+        batch = SimpleNamespace(
+            rids=["test"],
+            output_ids=rows,
+            prompt_tokens=counts,
+            cached_tokens=counts,
+            completion_tokens=None,
+            finished_reasons=[None],
+        )
+        await manager._handle_batch_output(batch)
+        result = state.out_queue.get_nowait()
+        assert result["token_ids"] == []
+        assert result["meta_info"]["prompt_tokens"] == (counts[0] if counts else 0)
+        assert result["meta_info"]["cached_tokens"] == (counts[0] if counts else 0)
+        assert result["meta_info"]["completion_tokens"] == 0
 
     asyncio.run(scenario())

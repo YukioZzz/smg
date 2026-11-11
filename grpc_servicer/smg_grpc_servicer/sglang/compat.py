@@ -48,8 +48,9 @@ class SchedulerOutputAdapter:
     them in separate commits. Only sparse usage needs retained request state.
     """
 
-    def __init__(self) -> None:
-        """Keep schema readers and sparse counts local to one output stream."""
+    def __init__(self, *, allow_empty_rows: bool = False) -> None:
+        """Own one stream; only the Python consumer permits absent legacy rows."""
+        self._allow_empty_rows = allow_empty_rows
         self._rows: Callable[[Any], list[list[int]]] | None = None
         self._usage: Callable[[Any], tuple[list[int], list[int]]] | None = None
         self._counts: dict[str, tuple[int, int]] = {}
@@ -65,7 +66,9 @@ class SchedulerOutputAdapter:
             if "output_ids_flat" in fields and "output_ids_offsets" in fields:
                 self._rows = self._flat_rows
             elif "output_ids" in fields:
-                self._rows = self._legacy_rows
+                self._rows = (
+                    self._legacy_rows_or_empty if self._allow_empty_rows else self._legacy_rows
+                )
             else:
                 raise ValueError("unsupported BatchTokenIDOutput token layout")
         rows = self._rows(out)
@@ -94,6 +97,13 @@ class SchedulerOutputAdapter:
             raise ValueError("output_ids row count does not match rids")
         # Older engines use array('q') rows; lists need no second copy.
         return [row if isinstance(row, list) else list(row) for row in rows]
+
+    @staticmethod
+    def _legacy_rows_or_empty(out: Any) -> list[list[int]]:
+        """Preserve the Python consumer's empty-token fallback on older engines."""
+        if not out.output_ids:
+            return [[] for _ in out.rids]
+        return SchedulerOutputAdapter._legacy_rows(out)
 
     @staticmethod
     def _flat_rows(out: Any) -> list[list[int]]:

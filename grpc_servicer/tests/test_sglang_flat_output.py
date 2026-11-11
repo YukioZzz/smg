@@ -206,3 +206,24 @@ def test_abort_releases_sparse_counts_even_when_the_socket_fails(monkeypatch):
     with pytest.raises(RuntimeError, match="disconnected"):
         sender.send_terminal_abort("a", "cancelled")
     assert "a" not in sender.output_adapter._counts
+
+
+@pytest.mark.parametrize("rows", [None, []])
+def test_slim_wire_still_rejects_absent_legacy_rows(rows):
+    """Python's empty-row fallback must not weaken the Rust wire contract."""
+    with pytest.raises(ValueError, match="row count"):
+        BatchTokenIDSlimOutput.from_full(batch(flat=False, output_ids=rows))
+
+
+@pytest.mark.parametrize("sparse", [False, True])
+def test_counts_are_indexable_for_every_request(sparse):
+    """Missing or short usage columns normalize to one count per request."""
+    for values in [None, [], [9]]:
+        out = batch(sparse=sparse)
+        if sparse:
+            out.request_stats = values and [SimpleNamespace(prompt_tokens=9, cached_tokens=9)]
+        else:
+            out.prompt_tokens = out.cached_tokens = values
+        rows, prompts, cached = SchedulerOutputAdapter().read(out)
+        assert len(rows) == len(prompts) == len(cached) == len(out.rids)
+        assert prompts == cached == ([9, 0, 0] if values else [0, 0, 0])
