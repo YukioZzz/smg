@@ -2453,4 +2453,137 @@ mod validated_body_tests {
 
         ctx.shutdown().await;
     }
+
+    /// The body of an embeddings or classify request for `input`, as a client
+    /// sends it.
+    fn input_body(input: serde_json::Value) -> String {
+        json!({"model": "mock-model", "input": input}).to_string()
+    }
+
+    /// An array of `n` one-letter inputs.
+    fn inputs(n: usize) -> serde_json::Value {
+        serde_json::Value::Array(vec![json!("x"); n])
+    }
+
+    /// `/v1/embeddings` runs the public API's rules on its body at the door
+    /// both the gRPC path and the HTTP relay read through: every `input`
+    /// shape the API refuses, a `dimensions` under one and an
+    /// `encoding_format` the API does not define are refused in the envelope
+    /// under the existing code for the fault, with the field in `param`; the
+    /// shapes the API takes pass the door (no worker serves the model here,
+    /// so the gateway's own not-found answer follows, never a refusal).
+    #[tokio::test]
+    async fn v1_embeddings_refuses_the_inputs_the_public_api_refuses() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        let with = |input: &str, options: serde_json::Value| {
+            let mut body = json!({"model": "mock-model", "input": input});
+            body.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            body.to_string()
+        };
+        for (sent, code, param) in [
+            (input_body(json!([])), "empty_array", "input"),
+            (input_body(json!("")), "empty_input", "input"),
+            (input_body(json!(["a", ""])), "empty_input", "input"),
+            (input_body(json!({"text": "x"})), "invalid_type", "input"),
+            (input_body(json!(null)), "invalid_type", "input"),
+            (input_body(json!(42)), "invalid_type", "input"),
+            (input_body(json!(["a", 1, null])), "invalid_type", "input"),
+            (input_body(json!([[1, 2], []])), "empty_array", "input"),
+            (input_body(inputs(2049)), "array_above_max_length", "input"),
+            (
+                with("x", json!({"dimensions": 0})),
+                "integer_below_min_value",
+                "dimensions",
+            ),
+            (
+                with("x", json!({"dimensions": -1})),
+                "integer_below_min_value",
+                "dimensions",
+            ),
+            (
+                with("x", json!({"encoding_format": "hex"})),
+                "unsupported_value",
+                "encoding_format",
+            ),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/embeddings", "application/json", &sent).await;
+            let shown = &sent[..sent.len().min(120)];
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{shown}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{shown}: {content_type}"
+            );
+            assert_envelope(&body, code, Some(param), shown);
+        }
+
+        for served in [
+            input_body(json!("hello")),
+            input_body(json!(["a", "b"])),
+            input_body(json!([1, 2, 3])),
+            input_body(json!([[1, 2], [3]])),
+            input_body(inputs(2048)),
+            with("x", json!({"dimensions": 1, "encoding_format": "float"})),
+            with("x", json!({"encoding_format": "base64"})),
+        ] {
+            let (status, _, body) = post(&app, "/v1/embeddings", "application/json", &served).await;
+            let shown = &served[..served.len().min(120)];
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{shown}: the door passes it to routing: {body}"
+            );
+            assert_eq!(body["error"]["code"], "model_not_found", "{shown}: {body}");
+        }
+
+        ctx.shutdown().await;
+    }
+
+    /// `/v1/classify` runs the embeddings route's `input` rule at the same
+    /// door: the shapes the public API refuses are refused in the envelope
+    /// under `input`, the shapes it takes pass to routing.
+    #[tokio::test]
+    async fn v1_classify_refuses_the_inputs_the_public_api_refuses() {
+        let ctx = AppTestContext::new(vec![]).await;
+        let app = ctx.create_app();
+
+        for (sent, code) in [
+            (input_body(json!([])), "empty_array"),
+            (input_body(json!("")), "empty_input"),
+            (input_body(json!({"a": 1})), "invalid_type"),
+            (input_body(json!(null)), "invalid_type"),
+            (input_body(json!(["a", 1])), "invalid_type"),
+            (input_body(inputs(2049)), "array_above_max_length"),
+        ] {
+            let (status, content_type, body) =
+                post(&app, "/v1/classify", "application/json", &sent).await;
+            let shown = &sent[..sent.len().min(120)];
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{shown}: {body}");
+            assert!(
+                content_type.starts_with("application/json"),
+                "{shown}: {content_type}"
+            );
+            assert_envelope(&body, code, Some("input"), shown);
+        }
+
+        for served in [
+            input_body(json!("hello")),
+            input_body(json!(["a", "b"])),
+            input_body(json!([1, 2, 3])),
+        ] {
+            let (status, _, body) = post(&app, "/v1/classify", "application/json", &served).await;
+            assert_eq!(
+                status,
+                StatusCode::NOT_FOUND,
+                "{served}: the door passes it to routing: {body}"
+            );
+            assert_eq!(body["error"]["code"], "model_not_found", "{served}: {body}");
+        }
+
+        ctx.shutdown().await;
+    }
 }

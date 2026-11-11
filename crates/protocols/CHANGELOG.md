@@ -53,6 +53,14 @@ All notable changes to `openai-protocol` are recorded here, newest first.
   axum's own text/plain `422`, `415` and `400` answered before. `V1RerankReqInput` refuses an
   empty `query` and an empty `documents` list, the rules of the native route's `RerankRequest`;
   its `top_n` keeps reading `0` as all documents. The four other types declare no rule.
+- `EmbeddingRequest` and `ClassifyRequest` run the public API's rule on `input` (a string, an
+  array of strings, an array of token ids or an array of token id arrays; nothing empty; at most
+  `MAX_INPUTS` = 2048 inputs), and `EmbeddingRequest` the API's bounds on `encoding_format`
+  (`float` or `base64`) and `dimensions` (at least one), so the gateway refuses the shapes the
+  API refuses in its error envelope with the field in `error.param` (`empty_array`,
+  `empty_input`, `array_above_max_length`, `invalid_type`, `unsupported_value`,
+  `integer_below_min_value`) before a worker sees them, on the gRPC path and the HTTP relay
+  alike. `validate_input` is one rule for both types.
 - A `json_schema` response format keeps its `description` when the request is written back for an
   upstream, as the HTTP router and the provider routers write it. The crate dropped the key while
   reading the format. The gRPC path's Responses-to-Chat conversion carries a Responses
