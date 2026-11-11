@@ -545,31 +545,6 @@ mod discovery_ownership_tests {
     use super::*;
     use crate::common::{create_test_context, test_app::create_test_app_with_context};
 
-    async fn send(
-        app: &axum::Router,
-        method: &str,
-        uri: &str,
-        body: Option<serde_json::Value>,
-    ) -> (StatusCode, serde_json::Value) {
-        let request = Request::builder().method(method).uri(uri);
-        let request = match body {
-            Some(body) => request
-                .header(CONTENT_TYPE, "application/json")
-                .body(Body::from(body.to_string())),
-            None => request.body(Body::empty()),
-        }
-        .unwrap();
-        let response = app.clone().oneshot(request).await.unwrap();
-        let status = response.status();
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
-            .await
-            .unwrap();
-        (
-            status,
-            serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
-        )
-    }
-
     /// Through the HTTP API a worker can neither be handed to discovery nor
     /// edited behind its provider's back: a label under the reserved prefix
     /// is a 400 on POST, PUT and PATCH; a PUT, or a PATCH of labels, of a
@@ -696,6 +671,37 @@ mod discovery_ownership_tests {
     }
 }
 
+/// One request to the worker API: the status and the JSON answer (`Null`
+/// for an empty body).
+#[expect(
+    clippy::unwrap_used,
+    reason = "test helper: the request is well-formed"
+)]
+async fn send(
+    app: &axum::Router,
+    method: &str,
+    uri: &str,
+    body: Option<serde_json::Value>,
+) -> (StatusCode, serde_json::Value) {
+    let request = Request::builder().method(method).uri(uri);
+    let request = match body {
+        Some(body) => request
+            .header(CONTENT_TYPE, "application/json")
+            .body(Body::from(body.to_string())),
+        None => request.body(Body::empty()),
+    }
+    .unwrap();
+    let response = app.clone().oneshot(request).await.unwrap();
+    let status = response.status();
+    let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+        .await
+        .unwrap();
+    (
+        status,
+        serde_json::from_slice(&bytes).unwrap_or(serde_json::Value::Null),
+    )
+}
+
 /// The JSON a GET of `uri` answers on the production route table.
 #[expect(clippy::unwrap_used, reason = "test helper: the answer is JSON")]
 async fn json_of(app: &axum::Router, uri: &str) -> serde_json::Value {
@@ -749,4 +755,134 @@ async fn the_manifest_format_exports_the_registered_fleet() {
     );
 
     ctx.shutdown().await;
+}
+
+#[cfg(test)]
+mod pending_registration_tests {
+    use std::{sync::Arc, time::Duration};
+
+    use smg::{config::RouterConfig, routers::http::router::Router as HttpRouter};
+
+    use super::*;
+    use crate::common::{create_test_context, test_app::create_test_app_with_context};
+
+    /// A loopback port nothing listens on: bound once to learn it, then closed.
+    fn closed_port() -> u16 {
+        std::net::TcpListener::bind("127.0.0.1:0")
+            .and_then(|listener| listener.local_addr())
+            .expect("a loopback port")
+            .port()
+    }
+
+    /// `GET /workers/{id}` until `settled` holds of its answer or `wait` runs
+    /// out: the last answer.
+    async fn get_until(
+        app: &axum::Router,
+        id: &str,
+        wait: Duration,
+        settled: impl Fn(StatusCode, &serde_json::Value) -> bool,
+    ) -> (StatusCode, serde_json::Value) {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let (status, body) = send(app, "GET", &format!("/workers/{id}"), None).await;
+            if settled(status, &body) || tokio::time::Instant::now() >= deadline {
+                return (status, body);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// A registration whose engine is unreachable polls it for the startup
+    /// timeout; a DELETE in that time ends the poll: the id reads gone, the
+    /// registration's task is over and the URL takes a new registration.
+    #[tokio::test]
+    async fn deleting_a_registration_still_polling_its_engine_ends_the_poll_and_frees_the_url() {
+        let context = create_test_context(RouterConfig {
+            disable_load_monitoring: true,
+            worker_startup_check_interval_secs: 1,
+            worker_startup_timeout_secs: 60,
+            ..Default::default()
+        })
+        .await;
+        let router = Arc::new(HttpRouter::new(&context).await.unwrap());
+        let app = create_test_app_with_context(router, Arc::clone(&context));
+        let engine = &context
+            .workflow_engines
+            .get()
+            .expect("the harness starts the engines")
+            .worker_registration;
+        let url = format!("http://127.0.0.1:{}", closed_port());
+
+        let (status, body) = send(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["worker_id"]
+            .as_str()
+            .expect("the 202 names the id")
+            .to_string();
+
+        // The registration is in its poll: its workflow runs and the worker
+        // reads pending.
+        for _ in 0..250 {
+            if engine.active_workflow_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(engine.active_workflow_count(), 1, "the registration polls");
+        let (status, body) = send(&app, "GET", &format!("/workers/{id}"), None).await;
+        assert_eq!(status, StatusCode::OK, "{body}");
+        assert_eq!(body["status"], json!("pending"), "{body}");
+        // The URL is held by the poll: a second registration is told to poll it.
+        let (status, body) = send(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+        assert_eq!(status, StatusCode::CONFLICT, "{body}");
+        assert_eq!(body["code"], json!("WORKER_CREATE_IN_PROGRESS"), "{body}");
+
+        let (status, body) = send(&app, "DELETE", &format!("/workers/{id}"), None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+        // The poll ends: the id reads gone and no registration task is left.
+        let (status, body) = get_until(&app, &id, Duration::from_secs(10), |status, _| {
+            status == StatusCode::NOT_FOUND
+        })
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the deleted registration still reads {body}"
+        );
+        for _ in 0..250 {
+            if engine.active_workflow_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            engine.active_workflow_count(),
+            0,
+            "the deleted registration's task is over"
+        );
+
+        // The URL takes a new registration under a new id, which a DELETE ends
+        // the same way.
+        let (status, body) = send(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let second = body["worker_id"]
+            .as_str()
+            .expect("the 202 names the id")
+            .to_string();
+        assert_ne!(second, id, "a new registration, a new id");
+        for _ in 0..250 {
+            if engine.active_workflow_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let (status, body) = send(&app, "DELETE", &format!("/workers/{second}"), None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let (status, body) = get_until(&app, &second, Duration::from_secs(10), |status, _| {
+            status == StatusCode::NOT_FOUND
+        })
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
 }

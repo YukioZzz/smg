@@ -16,7 +16,7 @@ use openai_protocol::worker::{
 use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
-use wfaas::WorkflowId;
+use wfaas::{StateStore, WorkflowId};
 
 use crate::{
     app_context::AppContext,
@@ -468,6 +468,45 @@ impl JobQueue {
     /// Remove job status (called when worker is deleted)
     pub fn remove_status(&self, worker_url: &str) {
         self.status_map.remove(worker_url);
+    }
+
+    /// Cancels the registration workflows in flight for `worker_url` and says
+    /// how many there were. A `DELETE` of a registration that has not reached
+    /// the registry (its engine unreachable or still starting, polled for the
+    /// startup timeout) ends the poll this way; the cancelled job's end
+    /// releases the URL's reservation and records its status as for any
+    /// registration that failed (`process_job`).
+    pub async fn cancel_registration(&self, worker_url: &str) -> Result<usize, String> {
+        let Some(context) = self.context.upgrade() else {
+            return Err("Job queue shutting down: AppContext dropped".to_string());
+        };
+        let engine = &context
+            .workflow_engines
+            .get()
+            .ok_or_else(|| "Workflow engines not initialized".to_string())?
+            .worker_registration;
+        let active = engine
+            .state_store()
+            .list_active()
+            .await
+            .map_err(|e| format!("Failed to list registration workflows: {e:?}"))?;
+        let mut cancelled = 0;
+        for state in active {
+            if state.context.data.config.url != worker_url {
+                continue;
+            }
+            engine
+                .cancel_workflow(state.instance_id)
+                .await
+                .map_err(|e| {
+                    format!(
+                        "Failed to cancel registration workflow {}: {e:?}",
+                        state.instance_id
+                    )
+                })?;
+            cancelled += 1;
+        }
+        Ok(cancelled)
     }
 
     /// Process a single job with status tracking and error handling
