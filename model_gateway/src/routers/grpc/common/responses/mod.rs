@@ -12,7 +12,7 @@ pub(crate) mod utils;
 pub(crate) use background::{spawn_unstored_sweeper, BackgroundResponses, BackgroundStream};
 pub(crate) use context::ResponsesContext;
 pub(crate) use driven::{build_sse_response_driven, driven_channel, DrivenBody, Reading};
-pub(crate) use history::load_history;
+pub(crate) use history::{load_history, ReplayInto};
 pub(crate) use streaming::{
     await_stream_startup, body_guards, build_sse_response, build_sse_response_from_stream,
     naming_parser, signal_stream_startup, stream_startup_channel, StreamStartupSender,
