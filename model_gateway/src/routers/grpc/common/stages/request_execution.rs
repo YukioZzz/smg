@@ -1513,7 +1513,9 @@ fn parallel_side_failed_first(
 /// side's answer, from which the decode call is due within what `watch`
 /// gives it (see [`DecodeSideWatch`]); past that, with the decode worker
 /// silent, the call is retired and the pair answers with the decode side's
-/// silence verdict.
+/// silence verdict. A failure pulled ahead there is the prefill side's
+/// answer at once, as its call's failure is: the pending decode call is
+/// retired, not waited for.
 async fn dispatch_pd_sides(
     mut prefill: SideDispatch,
     mut decode: SideDispatch,
@@ -1534,7 +1536,8 @@ async fn dispatch_pd_sides(
         /// still dispatching: whether it was output, a handoff.
         Witnessed(bool),
         /// The prefill side's first item came while the decode side was
-        /// still dispatching: whether it was a response, the side's answer.
+        /// still dispatching: whether it was a response, the side's answer
+        /// (a failure is `Alone`).
         Answered(bool),
         /// The decode side's deadline passed while it was still dispatching.
         DecodeDue,
@@ -1547,8 +1550,9 @@ async fn dispatch_pd_sides(
     let mut decode_result: Option<StreamResult> = None;
     let mut watching = handoff_to.is_some();
     // The prefill side's first item is awaited once, while the decode call
-    // is pending, and its answer arms the decode call's deadline.
-    let mut awaiting_answer = watch.is_some();
+    // is pending: a failure is the side's answer at once, a response arms
+    // the decode call's deadline.
+    let mut awaiting_answer = true;
     let mut decode_due: Option<Instant> = None;
 
     loop {
@@ -1575,7 +1579,10 @@ async fn dispatch_pd_sides(
             },
             () = decode_deadline(decode_due), if judging => DispatchStep::DecodeDue,
             answered = prefill_answered(prefill_result.as_mut().and_then(|r| r.as_mut().ok())),
-                if answering => DispatchStep::Answered(answered),
+                if answering => match answered {
+                    Err(error) => DispatchStep::Alone(PdSide::Prefill, error),
+                    Ok(answered) => DispatchStep::Answered(answered),
+                },
             result = &mut prefill, if prefill_result.is_none() => match result {
                 Err(error) if decode_result.is_none() => DispatchStep::Alone(PdSide::Prefill, error),
                 result => DispatchStep::Prefill(result),
@@ -1696,11 +1703,16 @@ fn book_prefill_answer_ahead(
 /// (see [`ProtoStream::first_item_ahead`]) while the decode side still
 /// dispatches, is a response: the side's answer, as
 /// [`first_prefill_response_within`] reads it, from which the decode side's
-/// first output is due (see [`DecodeSideWatch::due`]). Never completes
-/// without a stream.
-async fn prefill_answered(prefill: Option<&mut ProtoStream>) -> bool {
+/// first output is due (see [`DecodeSideWatch::due`]). A failure is the
+/// side's answer too, given back as such; the end is neither. Never
+/// completes without a stream.
+async fn prefill_answered(prefill: Option<&mut ProtoStream>) -> Result<bool, tonic::Status> {
     match prefill {
-        Some(prefill) => matches!(prefill.first_item_ahead().await, Some(Ok(_))),
+        Some(prefill) => match prefill.first_item_ahead().await {
+            Some(Ok(_)) => Ok(true),
+            Some(Err(status)) => Err(status.clone()),
+            None => Ok(false),
+        },
         None => std::future::pending().await,
     }
 }
