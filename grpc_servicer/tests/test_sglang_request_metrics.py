@@ -22,6 +22,7 @@ pytest.importorskip("zmq")
 @pytest.fixture
 def manager_mod(monkeypatch):
     """Load the real manager against isolated engine symbols for CPU regression tests."""
+    monkeypatch.setitem(sys.modules, "sglang.srt.disaggregation.mode", None)
     symbols = {
         "sglang.srt.disaggregation.utils": "DisaggregationMode FAKE_BOOTSTRAP_HOST",
         "sglang.srt.managers.io_struct": (
