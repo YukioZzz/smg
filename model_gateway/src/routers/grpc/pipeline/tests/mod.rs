@@ -2207,6 +2207,44 @@ async fn start_stream(pipeline: &RequestPipeline, components: Arc<SharedComponen
     response
 }
 
+/// Start a streaming request on `pipeline` whose decode side withholds its
+/// first token, and leave it while that token is still owed. On the
+/// disaggregated shapes the response opens with the decode side's first
+/// item, or with the verdict at the side's bound (three seconds here; see
+/// `DecodeSideWatch` and the sequential shape's `DecodeBound`), so a client
+/// that leaves before it drops the request future, as a connection's close
+/// drops the handler. The decode side holds its load the whole time.
+async fn leave_while_the_first_token_is_owed(
+    pipeline: &RequestPipeline,
+    components: Arc<SharedComponents>,
+    decode: &Arc<dyn Worker>,
+) {
+    let mut request = Box::pin(pipeline.execute_completion(
+        completion_request(true),
+        None,
+        MODEL.to_string(),
+        components,
+        None,
+        None,
+        None,
+    ));
+    tokio::select! {
+        response = &mut request => panic!(
+            "the response must wait for the decode side's first token, not open with {}",
+            response.status()
+        ),
+        () = tokio::time::sleep(Duration::from_millis(500)) => {}
+    }
+    assert_eq!(
+        decode.load(),
+        1,
+        "the decode side holds its load while its first token is owed"
+    );
+    // The client leaves: the connection's close drops the handler, and the
+    // request future with it.
+    drop(request);
+}
+
 /// gRPC regular path: the client drops the stream while the engine is
 /// still prefilling. The load guard rides the response body, so the drop
 /// releases the worker's load and reports the completion at once.
@@ -2869,8 +2907,10 @@ async fn a_client_that_leaves_a_background_harmony_responses_stream_leaves_its_g
 
 /// gRPC PD path: the prefill side answers on its own and reports when its
 /// phase ends; the decode side is still owed its first token when the
-/// client leaves, and reports with the dropped body. Both sides end with
-/// their load released, exactly once each.
+/// client leaves (the response waits for that token or the side's bound,
+/// see `leave_while_the_first_token_is_owed`), and reports with the
+/// dropped request. Both sides end with their load released, exactly once
+/// each.
 #[tokio::test]
 async fn cancelled_pd_stream_reports_the_prefill_and_decode_completions() {
     let hold = completion_request(true);
@@ -2883,14 +2923,7 @@ async fn cancelled_pd_stream_reports_the_prefill_and_decode_completions() {
     let pipeline = completion_pipeline(&worker_registry, Mode::PrefillDecode);
     let components = components(Arc::clone(&worker_registry)).await;
 
-    let response = start_stream(&pipeline, components).await;
-    assert_eq!(
-        decode.load(),
-        1,
-        "the decode side holds its load until the stream ends"
-    );
-
-    drop(response);
+    leave_while_the_first_token_is_owed(&pipeline, components, &decode).await;
 
     let mut urls = spy.wait_for(2).await;
     urls.sort();
@@ -2923,8 +2956,7 @@ async fn cancelled_pd_stream_with_admitted_prefill_reports_and_frees_the_slot() 
     );
     let components = components(Arc::clone(&worker_registry)).await;
 
-    let response = start_stream(&pipeline, components).await;
-    drop(response);
+    leave_while_the_first_token_is_owed(&pipeline, components, &decode).await;
 
     let mut urls = spy.wait_for(2).await;
     urls.sort();
@@ -2947,6 +2979,67 @@ async fn cancelled_pd_stream_with_admitted_prefill_reports_and_frees_the_slot() 
     .expect("admitted");
     drop(admitted);
     drop(hold);
+}
+
+/// gRPC PD path under prefill admission: the prefill side is drained while
+/// the decode side's first token is awaited, so its slot is free as soon as
+/// its phase ends, not when the decode side speaks. With one slot and a
+/// short queue, a second request dispatched while the first's decode side
+/// still owes its first token is admitted at once, and both stream.
+#[tokio::test]
+async fn a_pd_prefill_slot_is_free_while_the_decode_side_owes_its_first_token() {
+    const FIRST_TOKEN_AFTER: Duration = Duration::from_secs(2);
+    let prefill_port = spawn_stub(GatedScheduler::default()).await;
+    let decode_port = spawn_stub(GatedScheduler {
+        frame_gap: Some(FIRST_TOKEN_AFTER),
+        ..Default::default()
+    })
+    .await;
+    let worker_registry = Arc::new(WorkerRegistry::new());
+    register_worker(&worker_registry, prefill_port, WorkerType::Prefill);
+    register_worker(&worker_registry, decode_port, WorkerType::Decode);
+    // One slot; the second request's admission waits a second at most.
+    let admission = Arc::new(PrefillAdmission::new(1, 1, Duration::from_secs(1)));
+    let pipeline =
+        completion_pipeline_with_admission(&worker_registry, Mode::PrefillDecode, Some(admission));
+    let components = components(Arc::clone(&worker_registry)).await;
+
+    let first = pipeline.execute_completion(
+        completion_request(true),
+        None,
+        MODEL.to_string(),
+        Arc::clone(&components),
+        None,
+        None,
+        None,
+    );
+    let second = async {
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        let started = Instant::now();
+        let response = pipeline
+            .execute_completion(
+                completion_request(true),
+                None,
+                MODEL.to_string(),
+                components,
+                None,
+                None,
+                None,
+            )
+            .await;
+        (response, started.elapsed())
+    };
+    let (first, (second, second_took)) = tokio::join!(first, second);
+    assert_eq!(first.status(), http::StatusCode::OK);
+    assert_eq!(
+        second.status(),
+        http::StatusCode::OK,
+        "admitted while the first's decode side owes its first token: the first's prefill is drained"
+    );
+    assert!(
+        second_took < FIRST_TOKEN_AFTER + Duration::from_secs(1),
+        "the second request waited on no slot: {second_took:?}"
+    );
 }
 
 // ------------------------------------------------------------------

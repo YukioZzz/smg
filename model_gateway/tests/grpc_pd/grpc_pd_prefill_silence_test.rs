@@ -56,6 +56,16 @@
 //! or return an empty stream after a prefill that answered at once, and
 //! expect 504 `decode_worker_silent` within the bound, one `timeout` on the
 //! decode worker and nothing on the prefill.
+//!
+//! The decode side of the parallel shape has the same bound once its prefill
+//! side has answered: the pair's bound, or a decode side's bound after the
+//! answer, whichever is later, with the decode worker's own output as its
+//! reprieve. Two cases hold the decode call's headers or return an empty
+//! stream after a prefill that answered at once, and expect 504
+//! `decode_worker_silent` within the bound, one `timeout` on the decode
+//! worker, its breaker open and nothing on the prefill; one answers late
+//! within the bound and is not given up on; a non-streaming request is not
+//! bound by the decode side's first token, as on the sequential shape.
 
 use std::{
     sync::{
@@ -107,6 +117,9 @@ const SLACK: Duration = Duration::from_secs(3);
 const CASE_CAP: Duration = Duration::from_secs(30);
 /// The delay of a mock that must never answer within a case.
 const FOREVER: Duration = Duration::from_secs(3_600);
+/// How long after its call a decode engine of [`ParallelShape::HeadersLateThenHold`]
+/// returns its stream: late in the window, within the bound.
+const LATE_HEADERS: Duration = Duration::from_secs(2);
 /// How often a queued engine's gate lets a call through: five calls at once
 /// put the last one well past the bound, with an answer every turn.
 const TURN: Duration = Duration::from_millis(1_200);
@@ -317,11 +330,19 @@ enum ParallelShape {
     /// Every call streams its tokens at once and then stalls without a
     /// completion (a decode engine that stopped mid-stream).
     StreamThenStall,
+    /// Every call's stream is returned at once and stays empty for good (a
+    /// decode engine that admits the request and never schedules it, or a
+    /// handoff into it that never completes).
+    HoldOpen,
     /// The first call is answered at once; every later call's first chunk
     /// comes at its turn at the engine's gate (`queued`) or at the gate's
     /// first turn after the call, with its headers when `headers_held` (a
     /// servicer that sends them with the first message).
     AnswerFirstThenLate { queued: bool, headers_held: bool },
+    /// Every call returns its stream [`LATE_HEADERS`] after it arrives and
+    /// never writes to it (a slow handoff into a decode engine that then
+    /// never schedules the request).
+    HeadersLateThenHold,
 }
 
 /// A parallel-dispatch mock engine (the TokenSpeed proto, as the mock-worker
@@ -366,6 +387,11 @@ impl TokenSpeedAnswers for QueuedEngine {
                 drop(tx);
             }
             ParallelShape::StreamThenStall => produce_then_stall(tx, request_id),
+            ParallelShape::HoldOpen => hold_open(tx),
+            ParallelShape::HeadersLateThenHold => {
+                tokio::time::sleep(LATE_HEADERS).await;
+                hold_open(tx);
+            }
             ParallelShape::AnswerFirstThenLate { .. } if call == 1 => {
                 produce_at_turn(tx, Gate::default(), request_id);
             }
@@ -814,6 +840,234 @@ fn a_non_streaming_request_is_not_bound_by_the_decode_sides_first_token() {
     });
     assert_eq!(prefill_calls.calls(), 1);
     assert_eq!(decode_calls.calls(), 1, "not replayed");
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        0.0,
+        "no verdict on a non-streaming side:\n{rendered}"
+    );
+    assert_eq!(worker_errors(&rendered, "prefill", "timeout"), 0.0);
+}
+
+/// Parallel dispatch, the prefill answers at once and the decode call never
+/// returns its stream (a servicer that sends its headers with the first
+/// message, in front of a decode engine that never schedules the side):
+/// given up on within the decode side's bound, counted from the prefill
+/// side's answer, as the decode worker's timeout; the decode's breaker (set
+/// to one) opens, the prefill's stays closed, nothing is charged to the
+/// prefill.
+#[test]
+fn a_parallel_decode_that_returns_no_stream_after_the_prefill_answered_is_given_up_on_within_the_bound(
+) {
+    let rendered = render_after(|| async {
+        let prefill_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let decode_port = start_mock_grpc_worker(FOREVER).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
+        assert_decode_given_up_on(status, &body, elapsed);
+        assert!(!body.contains("prefill_worker_silent"), "{body}");
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Open,
+            "the silent decode worker is the one charged"
+        );
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill worker answered"
+        );
+        assert!(
+            workers[0]
+                .prefill_answered_ago()
+                .is_some_and(|ago| ago < BOUND + SLACK),
+            "the answer the dispatch loop pulled ahead is booked on the prefill worker when \
+             the pair is given up on: its book reads an answer, not a silent release"
+        );
+    });
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        1.0,
+        "one timeout on the decode worker:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "decode", "backend_error"),
+        0.0,
+        "counted once, under one class:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "the prefill, which answered, is not charged:\n{rendered}"
+    );
+}
+
+/// Parallel dispatch, the prefill answers at once and the decode returns its
+/// stream at once and never writes to it: the same verdict, from the
+/// first-response phase.
+#[test]
+fn a_parallel_decode_whose_stream_stays_empty_after_the_prefill_answered_is_given_up_on_within_the_bound(
+) {
+    let rendered = render_after(|| async {
+        let prefill_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let (decode_port, decode) = start_queued_grpc_worker(ParallelShape::HoldOpen).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
+        assert_decode_given_up_on(status, &body, elapsed);
+        assert!(!body.contains("prefill_worker_silent"), "{body}");
+        assert_eq!(decode.calls(), 1, "not replayed on the silent decode");
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Open,
+            "the silent decode worker is the one charged"
+        );
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill worker answered"
+        );
+    });
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        1.0,
+        "one timeout on the decode worker:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "the prefill, which answered, is not charged:\n{rendered}"
+    );
+}
+
+/// Parallel dispatch, the prefill answers at once and the decode call returns
+/// its stream late in the window (within the bound) and never writes to it:
+/// the verdict comes at the bound from the prefill side's answer, one window
+/// across both phases, not a second one from the late headers.
+#[test]
+fn a_parallel_decode_whose_stream_returns_late_and_stays_empty_is_given_up_on_at_the_bound_from_the_answer(
+) {
+    let rendered = render_after(|| async {
+        let prefill_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let (decode_port, decode) =
+            start_queued_grpc_worker(ParallelShape::HeadersLateThenHold).await;
+        let (router, workers) = build_pd_router_with(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+            CircuitBreakerConfig {
+                failure_threshold: 1,
+                ..Default::default()
+            },
+        )
+        .await;
+        let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
+        assert_decode_given_up_on(status, &body, elapsed);
+        assert!(
+            elapsed < LATE_HEADERS + BOUND,
+            "one window from the prefill side's answer, not a second one from the late headers: {elapsed:?}"
+        );
+        assert_eq!(decode.calls(), 1, "not replayed on the silent decode");
+        assert_eq!(
+            workers[1].circuit_breaker_state(),
+            CircuitState::Open,
+            "the silent decode worker is the one charged"
+        );
+        assert_eq!(
+            workers[0].circuit_breaker_state(),
+            CircuitState::Closed,
+            "the prefill worker answered"
+        );
+    });
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        1.0,
+        "one timeout on the decode worker:\n{rendered}"
+    );
+    assert_eq!(
+        worker_errors(&rendered, "prefill", "timeout"),
+        0.0,
+        "the prefill, which answered, is not charged:\n{rendered}"
+    );
+}
+
+/// Parallel dispatch, the decode call returns its stream late but within the
+/// bound (a slow handoff, not a frozen one): the request is answered, nothing
+/// is charged to either worker.
+#[test]
+fn a_parallel_decode_that_answers_late_within_its_bound_is_not_given_up_on() {
+    let late = Duration::from_secs(2);
+    let rendered = render_after(|| async {
+        let prefill_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let decode_port = start_mock_grpc_worker(late).await;
+        let router = build_pd_router(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+        )
+        .await;
+        let (status, body, elapsed) = one_streaming_chat(router.as_ref()).await;
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+        assert!(
+            elapsed >= late && elapsed < CASE_CAP,
+            "answered when the decode answered, within the bound: {elapsed:?}"
+        );
+    });
+    assert_eq!(
+        worker_errors(&rendered, "decode", "timeout"),
+        0.0,
+        "a decode that answers within its bound is not charged:\n{rendered}"
+    );
+    assert_eq!(worker_errors(&rendered, "prefill", "timeout"), 0.0);
+}
+
+/// Parallel dispatch, a non-streaming request: the decode side's first item
+/// is its whole generation, no first-token signal, so the bound does not
+/// apply, as on the sequential shape; a decode that answers past the bound
+/// still completes, and nothing is charged to either worker.
+#[test]
+fn a_non_streaming_request_on_the_parallel_shape_is_not_bound_by_the_decode_sides_first_token() {
+    let rendered = render_after(|| async {
+        let prefill_port = start_mock_grpc_worker(Duration::ZERO).await;
+        let decode_port = start_mock_grpc_worker(BOUND + Duration::from_secs(1)).await;
+        let router = build_pd_router(
+            &[
+                (prefill_port, WorkerType::Prefill),
+                (decode_port, WorkerType::Decode),
+            ],
+            RuntimeType::TokenSpeed,
+        )
+        .await;
+        let (status, body, elapsed) = one_chat(router.as_ref(), false).await;
+        assert_eq!(status, http::StatusCode::OK, "{body}");
+        assert!(
+            elapsed >= BOUND + Duration::from_secs(1) && elapsed < CASE_CAP,
+            "answered when the decode answered, past the bound: {elapsed:?}"
+        );
+    });
     assert_eq!(
         worker_errors(&rendered, "decode", "timeout"),
         0.0,

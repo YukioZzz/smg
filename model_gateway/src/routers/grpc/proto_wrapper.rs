@@ -1093,6 +1093,15 @@ impl PrefillTicket {
         })
     }
 
+    /// The side answered at `at`, reporting `cached` prompt tokens served
+    /// from the engine's prefix cache, and nothing reads its stream: the
+    /// ticket is released with that answer (a dispatch given up on with the
+    /// prefill side's first response pulled ahead, see
+    /// `book_prefill_answer_ahead` in the execution stage).
+    pub(crate) fn answered_at(mut self, cached: u64, at: Instant) {
+        self.first_response_at(cached, liveness::ms_at(at));
+    }
+
     /// The first response came back at `now_ms` on the gateway clock (the
     /// stamp its reader took for the message), reporting `cached` prompt
     /// tokens served from the engine's prefix cache.
@@ -1567,6 +1576,20 @@ fn reject_engine_error(
     }
 }
 
+#[cfg(test)]
+impl ProtoStream {
+    /// A side's stream whose first item is `first`, held ahead of its reader
+    /// as [`Self::first_item_ahead`] holds one, over a stream that has ended:
+    /// one response (or failure) and then the end, for the dispatch tests,
+    /// which have no engine to stream from.
+    pub(crate) fn answering_with(first: Result<ProtoGenerateResponse, tonic::Status>) -> Self {
+        Self::Ahead(Box::new(AheadStream {
+            inner: Self::Fanout(FanoutStream::new(Vec::new())),
+            first: Some(first),
+        }))
+    }
+}
+
 impl ProtoStream {
     /// Count this stream's responses as progress for `worker` (a response is
     /// progress whether it is a token of a streaming generation or the one
@@ -1691,9 +1714,10 @@ impl ProtoStream {
     /// The stream's first item (`None`: its end), pulled ahead of its reader
     /// and held for the next [`Self::next`] as it was, unbooked: a stream
     /// tracked later books it when its reader meets it. Only for a stream
-    /// nothing tracks yet (the parallel decode side while its prefill side
-    /// is awaited). Cancel-safe: dropped before the item comes, it leaves
-    /// the stream as it was.
+    /// nothing tracks yet (a parallel side while its partner's call is
+    /// pending: the decode side for the handoff credit, the prefill side for
+    /// the decode side's deadline). Cancel-safe: dropped before the item
+    /// comes, it leaves the stream as it was.
     pub(crate) async fn first_item_ahead(
         &mut self,
     ) -> Option<&Result<ProtoGenerateResponse, tonic::Status>> {
@@ -1712,6 +1736,15 @@ impl ProtoStream {
     /// [`Self::first_item_ahead`]).
     pub(crate) fn holds_item_ahead(&self) -> bool {
         matches!(self, Self::Ahead(_))
+    }
+
+    /// The item pulled ahead of the stream's reader, if the stream holds one
+    /// (see [`Self::first_item_ahead`]); nothing is pulled here.
+    pub(crate) fn item_ahead(&self) -> Option<&Result<ProtoGenerateResponse, tonic::Status>> {
+        match self {
+            Self::Ahead(ahead) => ahead.first.as_ref(),
+            _ => None,
+        }
     }
 
     /// The worker this stream was dispatched to, when it is tracked.

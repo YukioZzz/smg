@@ -147,15 +147,7 @@ async fn collect_prefill_decode(
         prefill_responses.push(complete);
     })
     .await
-    .map_err(|status| {
-        if let Some(worker) = &prefill_worker {
-            if let Some(sample) = UpstreamClass::of(&status).breaker_sample {
-                worker.record_outcome(sample);
-            }
-            UpstreamClass::account_collected_failure(worker.as_ref(), &status);
-        }
-        stream_failed(Some(PdSide::Prefill), "Prefill", &status, None)
-    })?;
+    .map_err(|status| prefill_drain_failed(prefill_worker.as_ref(), &status))?;
 
     // The client's prompt-side usage is the prefill side's.
     let mut decode_stream = decode.decode_side(prefill_cached_tokens);
@@ -175,6 +167,24 @@ async fn collect_prefill_decode(
         merge_prefill_logprobs(&prefill_responses, &mut decode_responses);
     }
     Ok(decode_responses)
+}
+
+/// The client's answer when a prefill side's stream failed in its drain, with
+/// the failure's accounting: the side's `worker`'s, when its stream is tracked
+/// (the parallel dispatch books the side on it and leaves the side's breaker
+/// sample to its reader), sampled on its breaker and counted once, as a
+/// streamed answer's reader does it.
+pub(crate) fn prefill_drain_failed(
+    worker: Option<&Arc<dyn Worker>>,
+    status: &tonic::Status,
+) -> Response {
+    if let Some(worker) = worker {
+        if let Some(sample) = UpstreamClass::of(status).breaker_sample {
+            worker.record_outcome(sample);
+        }
+        UpstreamClass::account_collected_failure(worker.as_ref(), status);
+    }
+    stream_failed(Some(PdSide::Prefill), "Prefill", status, None)
 }
 
 /// Copy the prompt logprobs of the first prefill response onto every decode
