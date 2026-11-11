@@ -138,7 +138,16 @@ def test_installed_engine_struct_uses_the_same_wire():
 
     io = pytest.importorskip("sglang.srt.managers.io_struct")
     fields = inspect.signature(io.BatchTokenIDOutput).parameters
-    out = batch(flat="output_ids_flat" in fields, sparse=False)
+    out = batch(flat="output_ids_flat" in fields, sparse="request_stats" in fields)
+    if "request_stats" in fields:
+        # Use real sparse stats with no dense headers on modern engines.
+        stats_fields = inspect.signature(io.RequestOutputStats).parameters
+        required = {
+            name: None for name, p in stats_fields.items() if p.default is inspect.Parameter.empty
+        }
+        out.request_stats = [
+            io.RequestOutputStats(**(required | vars(stats))) for stats in out.request_stats
+        ]
     values = {name: None for name, p in fields.items() if p.default is inspect.Parameter.empty}
     values.update({name: value for name, value in vars(out).items() if name in fields})
     actual = io.BatchTokenIDOutput(**values)

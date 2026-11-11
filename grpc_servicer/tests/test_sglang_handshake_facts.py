@@ -36,6 +36,9 @@ def request_structs(monkeypatch):
     """The engine's request structs the ready response reads its field order
     off, as small as the shape allows: tagged, positional, base class first."""
 
+    # Keep preloaded modern engine types out of this legacy-layout fixture.
+    monkeypatch.setitem(sys.modules, "sglang.srt.managers.req_types", None)
+
     class BaseReq(msgspec.Struct, tag=True, kw_only=True, array_like=True):
         rid: str | None = None
         http_worker_ipc: str | None = None
