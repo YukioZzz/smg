@@ -729,10 +729,13 @@ mod tests {
             .await
             .expect("a port to occupy");
         let taken_port = taken.local_addr().expect("address").port();
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        // The worker's port is this test's own: the registries are
+        // process-wide and never forget a name, so a port the OS picked could
+        // repeat the name of a worker an earlier test served.
+        let port = 65_480;
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", port))
             .await
             .expect("the worker's port");
-        let port = listener.local_addr().expect("address").port();
         let cfg = std::sync::Arc::new(Config {
             host: "127.0.0.1".to_string(),
             grpc_base_port: port,
