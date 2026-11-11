@@ -77,6 +77,7 @@ def request_structs(monkeypatch):
         "sglang.srt.managers.schedule_batch",
         MultimodalProcessorOutput=MultimodalProcessorOutput,
         MultimodalDataItem=MultimodalDataItem,
+        Modality=object,
     )
     _install(monkeypatch, "sglang.srt.sampling.sampling_params", SamplingParams=SamplingParams)
     _install(
@@ -84,6 +85,7 @@ def request_structs(monkeypatch):
         "sglang.srt.managers.schedule_batch",
         MultimodalProcessorOutput=MultimodalProcessorOutput,
         MultimodalDataItem=MultimodalDataItem,
+        Modality=object,
     )
 
 
