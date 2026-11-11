@@ -772,7 +772,9 @@ impl WorkerService {
         // startup timeout. Its removal is that poll's cancellation; the
         // cancelled job releases the id and the URL when it ends, and nothing
         // is registered to drain or remove. A registration that reached the
-        // registry meanwhile is removed below as any worker.
+        // registry meanwhile is removed below as any worker; a URL that only
+        // a startup or discovery registration holds goes to the removal job
+        // as before.
         if self.worker_registry.get(&worker_id).is_none() {
             let cancelled = job_queue
                 .cancel_registration(&url)

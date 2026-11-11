@@ -16,7 +16,7 @@ use openai_protocol::worker::{
 use smg_mcp::McpConfig;
 use tokio::sync::{mpsc, oneshot, Semaphore};
 use tracing::{debug, error, info, warn};
-use wfaas::{StateStore, WorkflowId};
+use wfaas::{StateStore, WorkflowError, WorkflowId, WorkflowStatus};
 
 use crate::{
     app_context::AppContext,
@@ -470,12 +470,16 @@ impl JobQueue {
         self.status_map.remove(worker_url);
     }
 
-    /// Cancels the registration workflows in flight for `worker_url` and says
-    /// how many there were. A `DELETE` of a registration that has not reached
-    /// the registry (its engine unreachable or still starting, polled for the
-    /// startup timeout) ends the poll this way; the cancelled job's end
-    /// releases the URL's reservation and records its status as for any
-    /// registration that failed (`process_job`).
+    /// Cancels the `POST /workers` registration workflows in flight for
+    /// `worker_url` and says how many a `DELETE` ends: the ones it cancels
+    /// and the ones an earlier `DELETE` cancelled whose job has not ended
+    /// yet (a repeated `DELETE` in that window queues no removal). A `DELETE`
+    /// of a registration that has not reached the registry (its engine
+    /// unreachable or still starting, polled for the startup timeout) ends
+    /// the poll this way; the cancelled job's end releases the URL's
+    /// reservation and records its status as for any registration that
+    /// failed (`process_job`). A startup or discovery registration of the
+    /// same URL (`Upsert`) is not the API's to end and runs on.
     pub async fn cancel_registration(&self, worker_url: &str) -> Result<usize, String> {
         let Some(context) = self.context.upgrade() else {
             return Err("Job queue shutting down: AppContext dropped".to_string());
@@ -485,26 +489,40 @@ impl JobQueue {
             .get()
             .ok_or_else(|| "Workflow engines not initialized".to_string())?
             .worker_registration;
-        let active = engine
+        let states = engine
             .state_store()
-            .list_active()
+            .list_all()
             .await
             .map_err(|e| format!("Failed to list registration workflows: {e:?}"))?;
         let mut cancelled = 0;
-        for state in active {
-            if state.context.data.config.url != worker_url {
+        for state in states {
+            if state.context.data.config.url != worker_url
+                || !matches!(
+                    state.context.data.registration_mode,
+                    WorkerRegistrationMode::CreateOnly
+                )
+            {
                 continue;
             }
-            engine
-                .cancel_workflow(state.instance_id)
-                .await
-                .map_err(|e| {
-                    format!(
-                        "Failed to cancel registration workflow {}: {e:?}",
-                        state.instance_id
-                    )
-                })?;
-            cancelled += 1;
+            match state.status {
+                WorkflowStatus::Pending | WorkflowStatus::Running => {
+                    match engine.cancel_workflow(state.instance_id).await {
+                        Ok(()) => cancelled += 1,
+                        // Ended between the listing and the cancel: its job's
+                        // end path runs as for any registration that ended.
+                        Err(WorkflowError::NotFound(_)) => {}
+                        Err(e) => {
+                            return Err(format!(
+                                "Failed to cancel registration workflow {}: {e:?}",
+                                state.instance_id
+                            ));
+                        }
+                    }
+                }
+                // Cancelled by an earlier DELETE; its job has not ended yet.
+                WorkflowStatus::Cancelled => cancelled += 1,
+                WorkflowStatus::Paused | WorkflowStatus::Completed | WorkflowStatus::Failed => {}
+            }
         }
         Ok(cancelled)
     }

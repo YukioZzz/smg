@@ -840,6 +840,28 @@ mod pending_registration_tests {
         let (status, body) = send(&app, "DELETE", &format!("/workers/{id}"), None).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
 
+        // A client's retry of the DELETE before the cancelled job has ended
+        // is 202 as well (404 once it has) and queues no removal, so a POST
+        // in that window is still told to poll the registration, and never
+        // lands under the cancelled id.
+        let (status, body) = send(&app, "DELETE", &format!("/workers/{id}"), None).await;
+        assert!(
+            status == StatusCode::ACCEPTED || status == StatusCode::NOT_FOUND,
+            "the repeated DELETE: {status} {body}"
+        );
+        let (status, body) = send(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+        if status == StatusCode::ACCEPTED {
+            // The cancelled job had ended: a new registration under a new id,
+            // ended here as the first one is below.
+            let third = body["worker_id"].as_str().unwrap_or_default().to_string();
+            assert_ne!(third, id, "the POST landed under the cancelled id: {body}");
+            let (status, body) = send(&app, "DELETE", &format!("/workers/{third}"), None).await;
+            assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        } else {
+            assert_eq!(status, StatusCode::CONFLICT, "{body}");
+            assert_eq!(body["code"], json!("WORKER_CREATE_IN_PROGRESS"), "{body}");
+        }
+
         // The poll ends: the id reads gone and no registration task is left.
         let (status, body) = get_until(&app, &id, Duration::from_secs(10), |status, _| {
             status == StatusCode::NOT_FOUND
