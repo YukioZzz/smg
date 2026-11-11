@@ -290,6 +290,42 @@ mod tests {
         );
     }
 
+    /// A wake that arrives while a burst settles is drained into that
+    /// burst: with two named files, the second file's write after the first
+    /// wake was taken leaves no second wake behind the settle, and the watch
+    /// still wakes for the next change. One file's burst cannot pin this:
+    /// inotify coalesces its writes before the first wake is taken.
+    #[tokio::test]
+    async fn a_wake_during_the_settle_is_drained_into_the_burst() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("workers.json");
+        let second = dir.path().join("tenants.json");
+        let (tx, mut rx) = mpsc::channel(1);
+        let _watch =
+            DirectoryWatch::start(dir.path(), names(&["workers.json", "tenants.json"]), tx)
+                .unwrap();
+
+        std::fs::write(&first, "{}").unwrap();
+        assert!(
+            woken(&mut rx, Duration::from_secs(10)).await,
+            "the first file's write not seen"
+        );
+        // A distinct event, never coalesced with the first file's: its wake
+        // lands while the burst settles.
+        std::fs::write(&second, "{}").unwrap();
+        settle(&mut rx).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "the second file's wake was not drained into the burst"
+        );
+
+        std::fs::write(&first, "{}").unwrap();
+        assert!(
+            woken(&mut rx, Duration::from_secs(10)).await,
+            "the watch did not wake after the settle"
+        );
+    }
+
     /// Only an event about the watched directory itself, removed or moved
     /// away, marks the watch lost; events about files inside it do not.
     #[test]
