@@ -12,10 +12,13 @@
 //! (wire modes, zones, labels, the index's overlap) stays at its default
 //! until the step that feeds it. The regular placement sites decide through
 //! the host (`routers::common::placement::select_from`); the pair, encode and
-//! admission paths follow in later steps. A removed worker's rows leave the
-//! engine's accounting with it ([`Decider::on_worker_removed`], from the
-//! policy registry's removal path); the rest of the membership feed (added,
-//! replaced, resized, snapshot) follows in a later step.
+//! admission paths follow in later steps. A removed or replaced worker's
+//! rows leave the engine's accounting with it ([`Decider::on_worker_removed`]
+//! and [`Decider::on_worker_replaced`], from the workflow's removal,
+//! registration and property-update steps). Mesh imports, which the registry
+//! rebuilds and removes without a workflow, do not reach these hooks yet;
+//! they and the rest of the membership feed (added, resized, snapshot)
+//! follow in a later step.
 
 use std::{
     cell::RefCell,
