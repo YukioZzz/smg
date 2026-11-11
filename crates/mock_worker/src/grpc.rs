@@ -560,6 +560,14 @@ impl MockScheduler {
         // Realistic mode: place the request on a rank, submit it to that
         // rank's engine simulator and stream its output.
         if !self.ranks.is_empty() {
+            // An `n` above the gateway's own bound is refused before the
+            // request touches a rank or the fault hook.
+            if input.choices > 128 {
+                return Err(Status::invalid_argument(format!(
+                    "n {} is above the gateway's bound of 128 choices",
+                    input.choices
+                )));
+            }
             let (rank, placed) = self.place(input.pin)?;
             if self.ranks.len() > 1 {
                 let line = rank_line(&input.request_id, input.pin, rank);
@@ -596,25 +604,61 @@ impl MockScheduler {
             // The admission hooks: the request is held here, between the
             // gateway and the engine, as a backlog in transit would hold it;
             // the load record does not see it until it lands.
+            // One engine request per choice: the realistic branch samples `n`
+            // outputs as the scripted path does, each under its own limit and
+            // its own seed (the choice salts it), and streams them one choice
+            // after another with the index on every frame. The admission hold
+            // is paid once and the prompt counts as pending prefill once (on
+            // the first choice), for the one request the gateway dispatched.
+            // The choices share the request id: an abort ends every one of
+            // them, a dropped stream releases them all at the next pass. The
+            // first cut of the fault hook, of either kind, ends the whole stream.
+            let choices = u32::try_from(input.choices.max(1)).unwrap_or(128);
+            let mut streams = Vec::with_capacity(choices as usize);
             engine.admit().await;
-            let (tx, rx) = mpsc::unbounded_channel();
-            let pending = (
-                Arc::clone(&rank.prefill_pending),
-                input.prompt_ids.len() as u64,
-            );
-            pending.0.fetch_add(pending.1, Ordering::Relaxed);
-            engine.submit(NewRequest {
-                request_id: input.request_id,
-                prompt_token_ids: input.prompt_ids,
-                max_new,
-                events: tx,
-            });
-            let stream = generate_stream(rx, input.stream, Some(pending), cut)
-                // The rank's count rides with the stream: down when it is dropped.
-                .map(move |item| {
-                    let _placed = &placed;
-                    item
+            let prompt_tokens = input.prompt_ids.len() as u64;
+            rank.prefill_pending
+                .fetch_add(prompt_tokens, Ordering::Relaxed);
+            let mut pending = Some((Arc::clone(&rank.prefill_pending), prompt_tokens));
+            for index in 0..choices {
+                let (tx, rx) = mpsc::unbounded_channel();
+                engine.submit(NewRequest {
+                    request_id: input.request_id.clone(),
+                    prompt_token_ids: input.prompt_ids.clone(),
+                    max_new,
+                    choice: index,
+                    events: tx,
                 });
+                streams.push(generate_stream(
+                    rx,
+                    input.stream,
+                    pending.take(),
+                    cut.clone(),
+                    index,
+                ));
+            }
+            let stream = stream::unfold(
+                (stream::iter(streams).flatten(), false),
+                |(mut rest, cut)| async move {
+                    // Read before the next choice is polled: polling it would
+                    // run that choice to its own cut, counted once more.
+                    if cut {
+                        return None;
+                    }
+                    let item = rest.next().await?;
+                    let cut = match &item {
+                        Err(_) => true,
+                        Ok(Frame::Complete(complete)) => complete.finish_reason == "error",
+                        Ok(_) => false,
+                    };
+                    Some((item, (rest, cut)))
+                },
+            )
+            // The rank's count rides with the stream: down when it is dropped.
+            .map(move |item| {
+                let _placed = &placed;
+                item
+            });
             return Ok(Box::pin(in_flight.until_done(stream)));
         }
 
@@ -1076,6 +1120,8 @@ struct Generating {
     /// The worker's pending-prefill counter and this request's share of it,
     /// settled at the first token (or at the end, if none came).
     pending: Option<(Arc<AtomicU64>, u64)>,
+    /// The choice this stream is, on every frame it emits.
+    index: u32,
     ended: bool,
 }
 
@@ -1108,6 +1154,7 @@ fn generate_stream(
     stream_chunks: bool,
     pending: Option<(Arc<AtomicU64>, u64)>,
     cut: Option<(u32, CutEnd, Arc<AtomicU64>)>,
+    index: u32,
 ) -> FrameStream {
     let init = Generating {
         rx,
@@ -1115,6 +1162,7 @@ fn generate_stream(
         stream_chunks,
         pending,
         cut,
+        index,
         ended: false,
     };
     Box::pin(stream::unfold(init, |mut st| async move {
@@ -1146,7 +1194,7 @@ fn generate_stream(
                                         cached_tokens,
                                         logprobs: None,
                                         matched_stop: None,
-                                        index: 0,
+                                        index: st.index,
                                     }))
                                 }
                             };
@@ -1162,7 +1210,7 @@ fn generate_stream(
                             completion_tokens: st.output_ids.len() as u32,
                             cached_tokens,
                             logprobs: None,
-                            index: 0,
+                            index: st.index,
                         });
                         return Some((Ok(chunk), st));
                     }
@@ -1182,7 +1230,7 @@ fn generate_stream(
                         cached_tokens,
                         logprobs: None,
                         matched_stop: None,
-                        index: 0,
+                        index: st.index,
                     });
                     return Some((Ok(complete), st));
                 }
@@ -2120,6 +2168,204 @@ mod tests {
         );
     }
 
+    /// `n` samples on the realistic branch: one engine request per choice,
+    /// streamed one choice after another with its index on every frame,
+    /// each cut by its own limit and each with its own output, the shape
+    /// the scripted path has.
+    #[tokio::test]
+    async fn two_choices_stream_one_after_the_other_with_their_indexes_on_a_realistic_worker() {
+        let (service, _stop) = scheduler_with_ranks(1, 65_110);
+        let mut request = generate_request("two-choices", None, 2);
+        request.sampling_params = Some(ts::SamplingParams {
+            max_new_tokens: Some(2),
+            n: 2,
+            ..Default::default()
+        });
+        let mut stream = service
+            .generate(Request::new(request))
+            .await
+            .expect("accepted")
+            .into_inner();
+        let mut frames = Vec::new();
+        while let Some(frame) = stream.next().await {
+            frames.push(frame.expect("a frame"));
+        }
+        let mut indexes = Vec::new();
+        let mut completes = Vec::new();
+        let mut outputs = Vec::new();
+        for frame in &frames {
+            match &frame.response {
+                Some(ts::generate_response::Response::Chunk(chunk)) => indexes.push(chunk.index),
+                Some(ts::generate_response::Response::Complete(complete)) => {
+                    indexes.push(complete.index);
+                    completes.push((
+                        complete.index,
+                        complete.completion_tokens,
+                        complete.output_ids.len(),
+                    ));
+                    outputs.push(complete.output_ids.clone());
+                }
+                other => panic!("a chunk or a complete frame, got {other:?}"),
+            }
+        }
+        assert_eq!(completes, vec![(0, 2, 2), (1, 2, 2)], "{frames:?}");
+        assert_eq!(
+            indexes,
+            vec![0, 0, 0, 1, 1, 1],
+            "two chunks then the complete per choice, in index order: {frames:?}"
+        );
+        assert_ne!(
+            outputs[0], outputs[1],
+            "the two choices differ by their seed: {outputs:?}"
+        );
+    }
+
+    /// An abort of an `n = 2` request ends both choices: the stream closes
+    /// with each choice's `abort` completion and the engine holds nothing of
+    /// the request afterwards.
+    #[tokio::test]
+    async fn an_abort_ends_every_choice_of_a_fanned_out_request_on_a_realistic_worker() {
+        let (service, _stop) = scheduler_with_ranks(1, 65_111);
+        let mut request = generate_request("two-choices-abort", None, 1_000);
+        request.sampling_params = Some(ts::SamplingParams {
+            max_new_tokens: Some(1_000),
+            n: 2,
+            ..Default::default()
+        });
+        let mut stream = service
+            .generate(Request::new(request))
+            .await
+            .expect("accepted")
+            .into_inner();
+        let first = stream
+            .next()
+            .await
+            .expect("a first frame")
+            .expect("a frame");
+        assert!(
+            matches!(
+                &first.response,
+                Some(ts::generate_response::Response::Chunk(_))
+            ),
+            "{first:?}"
+        );
+        service
+            .abort(Request::new(ts::AbortRequest {
+                request_id: "two-choices-abort".to_string(),
+                ..Default::default()
+            }))
+            .await
+            .expect("aborted");
+        let mut completes = Vec::new();
+        while let Some(frame) = stream.next().await {
+            if let Some(ts::generate_response::Response::Complete(complete)) =
+                frame.expect("a frame").response
+            {
+                completes.push((complete.index, complete.finish_reason));
+            }
+        }
+        assert_eq!(
+            completes,
+            vec![(0, "abort".to_string()), (1, "abort".to_string())],
+            "each choice ends with its abort completion"
+        );
+        let load = service.ranks[0].engine.load();
+        assert_eq!(
+            (
+                load.num_running_reqs,
+                load.num_waiting_reqs,
+                load.num_used_tokens
+            ),
+            (0, 0, 0),
+            "the engine holds nothing of the request: {load:?}"
+        );
+    }
+
+    /// The prompt of an `n = 2` request is one prefill in transit: the rank's
+    /// pending count is down once the first choice's first token is out, not
+    /// held by the choices streamed after it.
+    #[tokio::test]
+    async fn the_pending_prefill_count_settles_with_the_first_choice_on_a_realistic_worker() {
+        let (service, _stop) = scheduler_with_ranks(1, 65_112);
+        let mut request = generate_request("two-choices-pending", None, 2);
+        request.sampling_params = Some(ts::SamplingParams {
+            max_new_tokens: Some(2),
+            n: 2,
+            ..Default::default()
+        });
+        let mut stream = service
+            .generate(Request::new(request))
+            .await
+            .expect("accepted")
+            .into_inner();
+        let first = stream
+            .next()
+            .await
+            .expect("a first frame")
+            .expect("a frame");
+        assert!(
+            matches!(
+                &first.response,
+                Some(ts::generate_response::Response::Chunk(_))
+            ),
+            "{first:?}"
+        );
+        assert_eq!(
+            service.ranks[0].prefill_pending.load(Ordering::Relaxed),
+            0,
+            "the prompt counted once, settled by the first choice's first token"
+        );
+        while stream.next().await.is_some() {}
+    }
+
+    /// One `finish=error` cut on a non-streaming `n = 2` request ends the
+    /// stream at the first choice's `error` complete and counts once: the
+    /// second choice is never read, so it cannot run to a cut of its own.
+    #[tokio::test]
+    async fn the_first_cut_ends_a_fanned_out_request_before_the_next_choice_is_read() {
+        let (service, _stop) = scheduler_with_ranks(1, 65_113);
+        service.ranks[0]
+            .engine
+            .fault_fail(Some(crate::engine::RequestFault {
+                status: 503,
+                stall: std::time::Duration::ZERO,
+                after_tokens: Some(1),
+                finish_error: true,
+                scope: crate::engine::FaultScope::Requests(1),
+            }));
+        let mut request = generate_request("two-choices-cut", None, 4);
+        request.stream = false;
+        request.sampling_params = Some(ts::SamplingParams {
+            max_new_tokens: Some(4),
+            n: 2,
+            ..Default::default()
+        });
+        let mut stream = service
+            .generate(Request::new(request))
+            .await
+            .expect("accepted")
+            .into_inner();
+        let mut completes = Vec::new();
+        while let Some(frame) = stream.next().await {
+            match frame.expect("a frame").response {
+                Some(ts::generate_response::Response::Complete(complete)) => {
+                    completes.push((complete.index, complete.finish_reason));
+                }
+                other => panic!("a complete frame alone on a non-streaming request, got {other:?}"),
+            }
+        }
+        assert_eq!(
+            completes,
+            vec![(0, "error".to_string())],
+            "the first choice's cut ends the stream"
+        );
+        assert_eq!(
+            service.ranks[0].engine.fault_status().cut_total,
+            1,
+            "one cut, counted once"
+        );
+    }
+
     /// Unpinned requests go to the rank holding the fewest of the worker's
     /// requests, the scan start rotating, so three in a row on an idle worker
     /// cover its three ranks; the counts come down when the streams end.
@@ -2475,7 +2721,7 @@ mod tests {
             CutEnd::Status(Status::unavailable("injected")),
             Arc::clone(&cuts),
         ));
-        let mut stream = generate_stream(rx, true, None, cut);
+        let mut stream = generate_stream(rx, true, None, cut, 0);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let cut = stream.next().await.expect("the cut");
@@ -2494,7 +2740,7 @@ mod tests {
         drop(tx);
         let cuts = Arc::new(AtomicU64::new(0));
         let cut = Some((2, CutEnd::EngineError, Arc::clone(&cuts)));
-        let mut stream = generate_stream(rx, true, None, cut);
+        let mut stream = generate_stream(rx, true, None, cut, 0);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         assert_eq!(chunk_ids(stream.next().await), vec![2]);
         let item = stream
@@ -2530,7 +2776,7 @@ mod tests {
             CutEnd::Status(Status::internal("injected")),
             Arc::clone(&cuts),
         ));
-        let mut stream = generate_stream(rx, true, None, cut);
+        let mut stream = generate_stream(rx, true, None, cut, 0);
         assert_eq!(chunk_ids(stream.next().await), vec![1]);
         let complete = stream.next().await.expect("complete").expect("ok");
         assert!(matches!(complete, Frame::Complete(_)));
