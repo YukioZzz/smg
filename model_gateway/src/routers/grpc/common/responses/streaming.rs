@@ -1309,24 +1309,39 @@ impl ResponseStreamEventEmitter {
 
         // output_index and item_id are always set in the block above
         // when current_item_id was None and we allocated new ones
-        if let (Some(output_index), Some(item_id)) = (
-            self.current_message_output_index,
-            self.current_item_id.clone(),
-        ) {
-            let content_index = 0; // Single content part for now
+        let Some(output_index) = self.current_message_output_index else {
+            return Ok(());
+        };
+        let content_index = 0; // Single content part for now
 
-            // Emit content_part.added before first delta
-            if !self.has_emitted_content_part_added {
-                let event = self.emit_content_part_added(output_index, &item_id, content_index);
-                self.send_event(&event, tx).await?;
-                self.has_emitted_content_part_added = true;
-            }
-
-            // Emit text delta
-            self.send_text_delta(content, output_index, &item_id, content_index, tx)
-                .await?;
+        // Emit content_part.added before first delta: once per item, so the
+        // id's copy for the borrow split stays on this branch.
+        if !self.has_emitted_content_part_added {
+            let Some(item_id) = self.current_item_id.clone() else {
+                return Ok(());
+            };
+            let event = self.emit_content_part_added(output_index, &item_id, content_index);
+            self.send_event(&event, tx).await?;
+            self.has_emitted_content_part_added = true;
         }
-        Ok(())
+
+        // Emit text delta: the sequence number taken first, the id borrowed
+        // from the emitter and the frame written over the encoder alone, so
+        // no copy of the id is made per token.
+        let sequence_number = self.next_sequence();
+        let Some(item_id) = self.current_item_id.as_deref() else {
+            return Ok(());
+        };
+        self.accumulated_text.push_str(content);
+        let event = OutputTextDelta {
+            kind: OutputTextEvent::DELTA,
+            sequence_number,
+            output_index,
+            item_id,
+            content_index,
+            delta: content,
+        };
+        Self::send_frame(&mut self.encoder, OutputTextEvent::DELTA, &event, tx).await
     }
 
     /// A chat tool-call delta as Responses function_call events; without this
@@ -1447,8 +1462,19 @@ impl ResponseStreamEventEmitter {
         event: &T,
         tx: &SseSender,
     ) -> Result<(), String> {
-        let frame = self
-            .encoder
+        Self::send_frame(&mut self.encoder, event_type, event, tx).await
+    }
+
+    /// [`Self::send_typed`] over the encoder alone, for a caller that holds
+    /// a borrow of another field of the emitter while the frame goes out (the
+    /// per-token delta borrows the current item's id).
+    async fn send_frame<T: Serialize>(
+        encoder: &mut SseEncoder,
+        event_type: &str,
+        event: &T,
+        tx: &SseSender,
+    ) -> Result<(), String> {
+        let frame = encoder
             .encode_event(event_type, event)
             .map_err(|e| match e {
                 SseEncodeError::Json(e) => format!("Failed to serialize event: {e}"),
