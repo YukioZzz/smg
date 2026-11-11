@@ -768,8 +768,8 @@ impl WorkerService {
         let job_queue = self.get_job_queue()?;
 
         // An id with no worker behind it is a POST's registration still in
-        // flight: its engine unreachable or still starting, polled for the
-        // startup timeout. Its removal is that poll's cancellation; the
+        // flight: queued, or polling an engine unreachable or still starting
+        // for the startup timeout. Its removal is that poll's cancellation; the
         // cancelled job releases the id and the URL when it ends, and nothing
         // is registered to drain or remove. A registration that reached the
         // registry meanwhile is removed below as any worker; a URL that only
@@ -777,7 +777,7 @@ impl WorkerService {
         // as before.
         if self.worker_registry.get(&worker_id).is_none() {
             let cancelled = job_queue
-                .cancel_registration(&url)
+                .cancel_registration(&url, &worker_id)
                 .await
                 .map_err(|message| WorkerServiceError::QueueSubmitFailed { message })?;
             if cancelled > 0 && self.worker_registry.get(&worker_id).is_none() {

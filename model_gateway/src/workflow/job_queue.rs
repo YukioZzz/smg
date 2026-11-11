@@ -9,7 +9,7 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use dashmap::{mapref::entry::Entry, DashMap};
+use dashmap::{mapref::entry::Entry, DashMap, DashSet};
 use openai_protocol::worker::{
     ConnectionMode, JobStatus, RuntimeType, WorkerSpec, WorkerType, WorkerUpdateRequest,
 };
@@ -21,7 +21,7 @@ use wfaas::{StateStore, WorkflowError, WorkflowId, WorkflowStatus};
 use crate::{
     app_context::AppContext,
     config::{RouterConfig, RoutingMode},
-    worker::endpoint::Endpoint,
+    worker::{endpoint::Endpoint, registry::WorkerId},
     workflow::{
         create_mcp_workflow_data, create_tokenizer_workflow_data,
         create_wasm_registration_workflow_data, create_wasm_removal_workflow_data,
@@ -167,6 +167,11 @@ pub struct JobQueue {
     /// The waiters of [`Self::submit_and_wait`], by job key: a job's outcome
     /// is handed to its waiter when the job ends.
     outcomes: Outcomes,
+    /// The URLs whose `POST /workers` registration a `DELETE` ended before
+    /// the job had saved a workflow state (`cancel_registration`): the job
+    /// reads its URL here before and right after it starts the workflow, and
+    /// clears it when it ends.
+    cancelled_before_start: Arc<DashSet<String>>,
 }
 
 /// The waiters for a job's outcome, by job key.
@@ -219,6 +224,7 @@ impl JobQueue {
         let status_map = Arc::new(DashMap::new());
         let concurrency_limit = Arc::new(Semaphore::new(config.max_concurrent_jobs));
         let outcomes: Outcomes = Arc::new(DashMap::new());
+        let cancelled_before_start = Arc::new(DashSet::new());
 
         let queue = Arc::new(Self {
             tx,
@@ -226,6 +232,7 @@ impl JobQueue {
             status_map: status_map.clone(),
             concurrency_limit: concurrency_limit.clone(),
             outcomes: outcomes.clone(),
+            cancelled_before_start: cancelled_before_start.clone(),
         });
 
         // Single dispatcher task
@@ -233,6 +240,7 @@ impl JobQueue {
         let status = status_map.clone();
         let sem = concurrency_limit.clone();
         let waiters = outcomes.clone();
+        let marks = cancelled_before_start.clone();
 
         #[expect(
             clippy::disallowed_methods,
@@ -249,13 +257,22 @@ impl JobQueue {
                 let ctx_clone = ctx.clone();
                 let status_clone = status.clone();
                 let waiters_clone = waiters.clone();
+                let marks_clone = marks.clone();
 
                 #[expect(
                     clippy::disallowed_methods,
                     reason = "Job processing task: bounded by the semaphore permit which is dropped when the task completes"
                 )]
                 tokio::spawn(async move {
-                    Self::process_job(job, ctx_clone, status_clone, waiters_clone, permit).await;
+                    Self::process_job(
+                        job,
+                        ctx_clone,
+                        status_clone,
+                        waiters_clone,
+                        marks_clone,
+                        permit,
+                    )
+                    .await;
                 });
             }
 
@@ -470,20 +487,61 @@ impl JobQueue {
         self.status_map.remove(worker_url);
     }
 
-    /// Cancels the `POST /workers` registration workflows in flight for
-    /// `worker_url` and says how many a `DELETE` ends: the ones it cancels
-    /// and the ones an earlier `DELETE` cancelled whose job has not ended
-    /// yet (a repeated `DELETE` in that window queues no removal). A `DELETE`
-    /// of a registration that has not reached the registry (its engine
-    /// unreachable or still starting, polled for the startup timeout) ends
-    /// the poll this way; the cancelled job's end releases the URL's
-    /// reservation and records its status as for any registration that
-    /// failed (`process_job`). A startup or discovery registration of the
-    /// same URL (`Upsert`) is not the API's to end and runs on.
-    pub async fn cancel_registration(&self, worker_url: &str) -> Result<usize, String> {
+    /// Cancels the `POST /workers` registration in flight for `worker_url`,
+    /// the one `worker_id` was reserved for, and says how many a `DELETE`
+    /// ends. A workflow the store holds is cancelled (one an earlier `DELETE`
+    /// cancelled, its job not ended yet, counts without a second cancel, so a
+    /// repeated `DELETE` queues no removal); a job that has not saved its
+    /// state yet is marked, and ends when it reads the mark (`execute_job`).
+    /// The cancelled job's end releases the URL's reservation and records its
+    /// status as for any registration that failed (`process_job`). A startup
+    /// or discovery registration of the same URL (`Upsert`) is not the API's
+    /// to end and runs on.
+    pub async fn cancel_registration(
+        &self,
+        worker_url: &str,
+        worker_id: &WorkerId,
+    ) -> Result<usize, String> {
         let Some(context) = self.context.upgrade() else {
             return Err("Job queue shutting down: AppContext dropped".to_string());
         };
+        let cancelled = Self::cancel_registration_states(&context, worker_url).await?;
+        if cancelled > 0 || !self.add_worker_in_flight(worker_url) {
+            return Ok(cancelled);
+        }
+        // The job is queued, or started and has not saved its state yet. It
+        // may have saved it since the listing above: a second listing catches
+        // that, and the job's own read after its save catches the rest. A job
+        // that ended meanwhile, or an id that no longer names the URL (its
+        // registration over, a new one admitted), takes the mark back.
+        self.cancelled_before_start.insert(worker_url.to_string());
+        let cancelled = Self::cancel_registration_states(&context, worker_url).await?;
+        if cancelled > 0
+            || !self.add_worker_in_flight(worker_url)
+            || context.worker_registry.get_url_by_id(worker_id).as_deref() != Some(worker_url)
+        {
+            self.cancelled_before_start.remove(worker_url);
+            return Ok(cancelled);
+        }
+        Ok(1)
+    }
+
+    /// Whether the status entry under `url` is a registration job that has
+    /// not ended: queued, or running (the type name of [`Job::job_type`]).
+    fn add_worker_in_flight(&self, url: &str) -> bool {
+        self.status_map.get(url).is_some_and(|status| {
+            status.job_type == "AddWorker"
+                && matches!(status.status.as_str(), "pending" | "processing")
+        })
+    }
+
+    /// Cancels the `POST /workers` registration workflows the store holds for
+    /// `worker_url`: the active ones are cancelled, a cancelled one counts, one
+    /// that ended between the listing and the cancel is skipped.
+    async fn cancel_registration_states(
+        context: &AppContext,
+        worker_url: &str,
+    ) -> Result<usize, String> {
         let engine = &context
             .workflow_engines
             .get()
@@ -533,6 +591,7 @@ impl JobQueue {
         context: Weak<AppContext>,
         status_map: Arc<DashMap<String, JobStatus>>,
         outcomes: Outcomes,
+        cancelled_before_start: Arc<DashSet<String>>,
         permit: tokio::sync::OwnedSemaphorePermit,
     ) {
         let job_type = job.job_type();
@@ -563,7 +622,7 @@ impl JobQueue {
         // Execute job
         match context.upgrade() {
             Some(ctx) => {
-                let result = Self::execute_job(&job, &ctx).await;
+                let result = Self::execute_job(&job, &ctx, &cancelled_before_start).await;
                 let duration = start.elapsed();
                 // Only `POST /workers` (CreateOnly) reserves an id for its 202; a failed
                 // upsert from discovery or startup owns no reservation to drop. Release
@@ -581,6 +640,10 @@ impl JobQueue {
                     ctx.worker_registry.release_reservation(&worker_url);
                 }
                 Self::record_job_completion(job_type, &worker_url, duration, &result, &status_map);
+                // A mark set for this job after its reads is over with it.
+                if matches!(job, Job::AddWorker { .. }) {
+                    cancelled_before_start.remove(&worker_url);
+                }
                 Self::deliver_outcome(&outcomes, &worker_url, result);
             }
             None => {
@@ -600,12 +663,25 @@ impl JobQueue {
     }
 
     /// Execute a specific job
-    async fn execute_job(job: &Job, context: &Arc<AppContext>) -> Result<String, String> {
+    async fn execute_job(
+        job: &Job,
+        context: &Arc<AppContext>,
+        cancelled_before_start: &DashSet<String>,
+    ) -> Result<String, String> {
         match job {
             Job::AddWorker {
                 config,
                 registration_mode,
             } => {
+                // A DELETE that came before this job started ended the
+                // registration (`cancel_registration`): the job ends as a
+                // failed one, and its end path releases the URL. A startup or
+                // discovery registration is not the API's to end; it drops
+                // the mark so that no later POST's job inherits it.
+                let create_only = matches!(registration_mode, WorkerRegistrationMode::CreateOnly);
+                if cancelled_before_start.remove(&config.url).is_some() && create_only {
+                    return Err("Registration cancelled before it started".to_string());
+                }
                 let engines = context
                     .workflow_engines
                     .get()
@@ -624,6 +700,18 @@ impl JobQueue {
                     .start_workflow(WorkflowId::new("worker_registration"), workflow_data)
                     .await
                     .map_err(|e| format!("Failed to start worker registration workflow: {e:?}"))?;
+                // A DELETE between the read above and the state's save found
+                // no state to cancel and left its mark: the workflow just
+                // started is cancelled here, and the wait below ends with it.
+                if create_only && cancelled_before_start.remove(&config.url).is_some() {
+                    engines
+                        .worker_registration
+                        .cancel_workflow(instance_id)
+                        .await
+                        .map_err(|e| {
+                            format!("Failed to cancel worker registration workflow: {e:?}")
+                        })?;
+                }
 
                 debug!(
                     "Started worker registration workflow for {} (instance: {})",

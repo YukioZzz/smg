@@ -857,6 +857,11 @@ mod pending_registration_tests {
             assert_ne!(third, id, "the POST landed under the cancelled id: {body}");
             let (status, body) = send(&app, "DELETE", &format!("/workers/{third}"), None).await;
             assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+            let (status, body) = get_until(&app, &third, Duration::from_secs(10), |status, _| {
+                status == StatusCode::NOT_FOUND
+            })
+            .await;
+            assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
         } else {
             assert_eq!(status, StatusCode::CONFLICT, "{body}");
             assert_eq!(body["code"], json!("WORKER_CREATE_IN_PROGRESS"), "{body}");
@@ -899,6 +904,73 @@ mod pending_registration_tests {
             }
             tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        let (status, body) = send(&app, "DELETE", &format!("/workers/{second}"), None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let (status, body) = get_until(&app, &second, Duration::from_secs(10), |status, _| {
+            status == StatusCode::NOT_FOUND
+        })
+        .await;
+        assert_eq!(status, StatusCode::NOT_FOUND, "{body}");
+    }
+
+    /// A DELETE straight after the 202, before the registration's job has
+    /// started its workflow, ends the registration as well: the id reads
+    /// gone, no task is left and the URL takes a new registration.
+    #[tokio::test]
+    async fn deleting_a_registration_before_its_job_starts_ends_it_too() {
+        let context = create_test_context(RouterConfig {
+            disable_load_monitoring: true,
+            worker_startup_check_interval_secs: 1,
+            worker_startup_timeout_secs: 60,
+            ..Default::default()
+        })
+        .await;
+        let router = Arc::new(HttpRouter::new(&context).await.unwrap());
+        let app = create_test_app_with_context(router, Arc::clone(&context));
+        let engine = &context
+            .workflow_engines
+            .get()
+            .expect("the harness starts the engines")
+            .worker_registration;
+        let url = format!("http://127.0.0.1:{}", closed_port());
+
+        let (status, body) = send(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let id = body["worker_id"]
+            .as_str()
+            .expect("the 202 names the id")
+            .to_string();
+        let (status, body) = send(&app, "DELETE", &format!("/workers/{id}"), None).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+
+        let (status, body) = get_until(&app, &id, Duration::from_secs(10), |status, _| {
+            status == StatusCode::NOT_FOUND
+        })
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "the registration deleted before its job started still reads {body}"
+        );
+        for _ in 0..250 {
+            if engine.active_workflow_count() == 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert_eq!(
+            engine.active_workflow_count(),
+            0,
+            "no registration task is left"
+        );
+
+        let (status, body) = send(&app, "POST", "/workers", Some(json!({"url": url}))).await;
+        assert_eq!(status, StatusCode::ACCEPTED, "{body}");
+        let second = body["worker_id"]
+            .as_str()
+            .expect("the 202 names the id")
+            .to_string();
+        assert_ne!(second, id, "a new registration, a new id");
         let (status, body) = send(&app, "DELETE", &format!("/workers/{second}"), None).await;
         assert_eq!(status, StatusCode::ACCEPTED, "{body}");
         let (status, body) = get_until(&app, &second, Duration::from_secs(10), |status, _| {
