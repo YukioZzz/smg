@@ -10,13 +10,17 @@
 //! is removed: the address's series are dropped at once, and writes that
 //! arrive after the removal (a health check racing it, a load guard released
 //! after it, a stale handle) fall into no-op handles until the address is
-//! registered again. The series render after the exporter's output, in the
-//! exporter's format and with the exporter's histogram configuration.
+//! registered again, or until nothing holds the removed worker any more:
+//! the registry hands the store the worker's `Weak` with the retirement, and
+//! the upkeep forgets the addresses whose workers are all gone, so the
+//! retired set is bounded by the removed workers still referenced. The
+//! series render after the exporter's output, in the exporter's format and
+//! with the exporter's histogram configuration.
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, HashMap},
     fmt::{Display, Write as _},
-    sync::{atomic::Ordering, Arc, OnceLock},
+    sync::{atomic::Ordering, Arc, OnceLock, Weak},
 };
 
 use metrics::{
@@ -37,6 +41,8 @@ use metrics_util::{
 use parking_lot::{Mutex, RwLock};
 use quanta::Instant;
 
+use crate::worker::Worker;
+
 /// The label that keys a series to a worker; its value is the worker URL.
 const WORKER_LABEL: &str = "worker";
 
@@ -52,6 +58,23 @@ pub(crate) fn install(series: Arc<WorkerSeries>) {
 /// The installed store, if the Prometheus recorder has been installed.
 pub(crate) fn installed() -> Option<&'static Arc<WorkerSeries>> {
     INSTALLED.get()
+}
+
+/// The installed store, a default one (the exporter's quantiles, no
+/// buckets) installed first when the process has none: what a test of the
+/// registry's handoff to the store reads.
+#[cfg(test)]
+pub(crate) fn installed_or_default() -> &'static Arc<WorkerSeries> {
+    INSTALLED.get_or_init(|| {
+        Arc::new(WorkerSeries::new(DistributionBuilder::new(
+            metrics_util::parse_quantiles(&[0.0, 0.5, 0.9, 0.95, 0.99, 0.999, 1.0]),
+            None,
+            None,
+            None,
+            None,
+            None,
+        )))
+    })
 }
 
 /// Append the installed store's series to a scrape.
@@ -70,11 +93,13 @@ pub(crate) fn run_upkeep() {
 
 /// The per-worker series of the process, keyed by the worker URL.
 pub(crate) struct WorkerSeries {
-    /// Addresses whose registration was removed; their writes are dropped
-    /// until the address registers again. Handle creation holds the read
-    /// side, retirement the write side, so no series is created for an
-    /// address between its retirement and the drop of its series.
-    retired: RwLock<HashSet<String>>,
+    /// Addresses whose registration was removed, each with the removed
+    /// workers still referenced; their writes are dropped until the address
+    /// registers again or the upkeep finds every one of those workers gone.
+    /// Handle creation holds the read side, retirement the write side, so no
+    /// series is created for an address between its retirement and the drop
+    /// of its series.
+    retired: RwLock<HashMap<String, Vec<Weak<dyn Worker>>>>,
     registry: Registry<Key, WorkerStorage>,
     /// Descriptions by sanitized metric name, for the `# HELP` lines.
     descriptions: RwLock<HashMap<String, SharedString>>,
@@ -87,7 +112,7 @@ impl WorkerSeries {
     /// A store whose histograms take the exporter's bucket configuration.
     pub(crate) fn new(distribution_builder: DistributionBuilder) -> Self {
         Self {
-            retired: RwLock::new(HashSet::new()),
+            retired: RwLock::new(HashMap::new()),
             registry: Registry::new(WorkerStorage),
             descriptions: RwLock::new(HashMap::new()),
             distribution_builder,
@@ -101,10 +126,11 @@ impl WorkerSeries {
     }
 
     /// The registration at `url` was removed: drop its series, and drop the
-    /// writes that follow until the address registers again.
-    pub(crate) fn retire(&self, url: &str) {
+    /// writes that follow until the address registers again or `worker`, the
+    /// removed one, is gone from every handle that could still write for it.
+    pub(crate) fn retire(&self, url: &str, worker: Weak<dyn Worker>) {
         let mut retired = self.retired.write();
-        retired.insert(url.to_owned());
+        retired.entry(url.to_owned()).or_default().push(worker);
         self.registry.retain_counters(|key, _| !keyed_to(key, url));
         self.registry.retain_gauges(|key, _| !keyed_to(key, url));
         self.registry
@@ -123,7 +149,7 @@ impl WorkerSeries {
 
     fn counter(&self, key: &Key, url: &str) -> Counter {
         let retired = self.retired.read();
-        if retired.contains(url) {
+        if retired.contains_key(url) {
             return Counter::noop();
         }
         self.registry
@@ -132,7 +158,7 @@ impl WorkerSeries {
 
     fn gauge(&self, key: &Key, url: &str) -> Gauge {
         let retired = self.retired.read();
-        if retired.contains(url) {
+        if retired.contains_key(url) {
             return Gauge::noop();
         }
         self.registry
@@ -141,17 +167,35 @@ impl WorkerSeries {
 
     fn histogram(&self, key: &Key, url: &str) -> Histogram {
         let retired = self.retired.read();
-        if retired.contains(url) {
+        if retired.contains_key(url) {
             return Histogram::noop();
         }
         self.registry
             .get_or_create_histogram(key, |samples| Histogram::from_arc(Arc::clone(samples)))
     }
 
+    /// The retired addresses, for the tests.
+    #[cfg(test)]
+    pub(crate) fn retired_len(&self) -> usize {
+        self.retired.read().len()
+    }
+
+    /// Whether `worker_url` is retired, for the tests.
+    #[cfg(test)]
+    pub(crate) fn is_retired(&self, worker_url: &str) -> bool {
+        self.retired.read().contains_key(worker_url)
+    }
+
     /// Fold recorded histogram samples into the per-series distributions, as
     /// the exporter's upkeep does, so the sample buffers stay small between
-    /// scrapes.
+    /// scrapes, and forget the retired addresses whose removed workers are all
+    /// gone: nothing can write for them any more, so the set stays bounded by
+    /// the removed workers still referenced.
     pub(crate) fn run_upkeep(&self) {
+        self.retired.write().retain(|_, workers| {
+            workers.retain(|worker| worker.strong_count() > 0);
+            !workers.is_empty()
+        });
         let mut distributions = self.distributions.lock();
         self.registry.visit_histograms(|key, samples| {
             let distribution = distributions.entry(key.clone()).or_insert_with(|| {
@@ -495,7 +539,8 @@ mod tests {
             "{workers}"
         );
 
-        series.retire(WORKER_A);
+        // A dead witness: the test's late writes race the removal, before any upkeep.
+        series.retire(WORKER_A, Weak::<crate::worker::BasicWorker>::new());
         let (_, workers) = scrape(&series, || {
             // Writes after the removal: a racing health check, a late outcome.
             gauge!("health", "worker" => WORKER_A).set(0.0);

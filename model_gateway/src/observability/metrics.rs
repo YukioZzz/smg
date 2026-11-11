@@ -1,6 +1,11 @@
 #[cfg(test)]
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
-use std::{borrow::Cow, collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    borrow::Cow,
+    collections::HashMap,
+    sync::{Arc, Weak},
+    time::Duration,
+};
 
 use dashmap::DashMap;
 use llm_tokenizer::{
@@ -23,6 +28,7 @@ use super::worker_metrics::{self, WorkerSeries, WorkerSeriesRecorder};
 use crate::{
     config::{ConfigError, ConfigResult},
     routers::grpc::regular::symphony::telemetry as symphony_telemetry,
+    worker::Worker,
 };
 
 // Interned strings are never freed; only intern low-cardinality, server-controlled
@@ -3814,10 +3820,12 @@ impl Metrics {
     /// series (every family labelled `worker`, see `worker_metrics`), so the
     /// scrape and the time-series database stop growing with pod churn, and
     /// drop the writes that arrive after the removal until the address
-    /// registers again. The interned label goes with them.
-    pub fn remove_worker_metrics(worker_url: &str) {
+    /// registers again or `worker`, the removed one, is gone from every
+    /// handle that could still write for it. The interned label goes with
+    /// them.
+    pub fn remove_worker_metrics(worker_url: &str, worker: Weak<dyn Worker>) {
         if let Some(series) = worker_metrics::installed() {
-            series.retire(worker_url);
+            series.retire(worker_url, worker);
         }
         handles::worker_set_changed();
         STRING_INTERNER.remove(worker_url);

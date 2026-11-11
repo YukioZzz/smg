@@ -3,10 +3,13 @@ use std::collections::HashMap;
 use openai_protocol::model_card::ModelCard;
 
 use super::*;
-use crate::worker::{
-    circuit_breaker::{CircuitBreakerConfig, CircuitState},
-    test_support::no_health_check,
-    BasicWorkerBuilder, WorkerLoadGuard,
+use crate::{
+    observability::worker_metrics,
+    worker::{
+        circuit_breaker::{CircuitBreakerConfig, CircuitState},
+        test_support::no_health_check,
+        BasicWorkerBuilder, WorkerLoadGuard,
+    },
 };
 
 /// A worker whose breaker opens on one failed request and would stay
@@ -3542,4 +3545,39 @@ fn clear_all_overload_flags_resets_every_model() {
     assert!(!b.is_overloaded());
     assert_eq!(registry.overloaded_worker_count("m1"), 0);
     assert_eq!(registry.overloaded_worker_count("m2"), 0);
+}
+
+/// A removed worker's address stays retired in the series store while a
+/// handle to the worker lives (a late write of that handle lands nowhere),
+/// and the store's upkeep forgets it once the last handle is gone: the
+/// registry hands the store the removed worker's own witness.
+#[test]
+fn a_removed_workers_address_is_retired_until_its_last_handle_is_gone() {
+    let series = worker_metrics::installed_or_default();
+    let registry = WorkerRegistry::new();
+    let url = "http://retired-seam:8080";
+    let worker: Arc<dyn Worker> = Arc::new(
+        BasicWorkerBuilder::new(url)
+            .model(ModelCard::new("m"))
+            .health_config(no_health_check())
+            .build(),
+    );
+    let held = Arc::clone(&worker);
+    let id = registry.register(worker).unwrap();
+    assert!(!series.is_retired(url), "a registered address is live");
+
+    registry.remove(&id);
+    assert!(series.is_retired(url), "the removal retires the address");
+    series.run_upkeep();
+    assert!(
+        series.is_retired(url),
+        "a held worker keeps its address retired through the upkeep"
+    );
+
+    drop(held);
+    series.run_upkeep();
+    assert!(
+        !series.is_retired(url),
+        "the upkeep forgets the address once the removed worker is gone"
+    );
 }

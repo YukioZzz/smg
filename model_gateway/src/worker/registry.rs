@@ -1910,7 +1910,7 @@ impl WorkerRegistry {
             // Retire the URL's series while the URL still maps to this id: a
             // registration of the same URL cannot slip in between and have its
             // fresh series retired under it.
-            Metrics::remove_worker_metrics(worker.url());
+            Metrics::remove_worker_metrics(worker.url(), Arc::downgrade(&worker));
             self.url_to_id.remove(worker.url());
             // We hold _guard; drop the DashMap entry but the Mutex stays alive via Arc.
             self.worker_mutation_locks.remove(worker_id);
