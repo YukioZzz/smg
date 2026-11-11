@@ -1477,8 +1477,10 @@ impl Router {
             let rechunker = rechunk
                 .filter(|_| upstream_sse)
                 .map(|policy| SseRechunker::with_observer(policy, NoopObserver));
-            if rechunker.is_some() {
-                // Re-chunking changes the body length.
+            if upstream_sse {
+                // The relay may change an SSE body's length: re-chunking
+                // re-slices it, and a cut after a successful head appends
+                // the error event and the stream's end on the plain path.
                 response_headers.remove(CONTENT_LENGTH);
             }
             let mut response = relay_streaming_body(
@@ -6555,11 +6557,12 @@ mod tests {
         format!("http://{addr}")
     }
 
-    /// Re-slicing changes the body's length: a re-sliced stream reaches the
-    /// client without the upstream's `Content-Length` and with its text
-    /// whole, while a plain relay keeps the header with the bytes it copies.
+    /// A streamed SSE relay may change the body's length, by re-slicing it
+    /// or by ending a cut stream with its error event, so a sized upstream
+    /// answer reaches the client without the upstream's `Content-Length` on
+    /// the re-sliced path and on the plain path alike, its text whole.
     #[tokio::test]
-    async fn a_re_sliced_stream_drops_the_upstreams_content_length() {
+    async fn a_streamed_sse_relay_drops_the_upstreams_content_length() {
         use openai_protocol::validated::Normalizable;
 
         const BODY: &str = "data: {\"id\":\"sized\",\"object\":\"chat.completion.chunk\",\"created\":1700000000,\
@@ -6572,7 +6575,7 @@ mod tests {
         let url = spawn_sized_sse_worker(BODY).await;
         let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
         let tenant = TenantRequestMeta::new(crate::tenant::TenantKey::new("test-tenant"));
-        for (model, keeps_length) in [("MiniMax-M3", false), ("served-plain-relay-model", true)] {
+        for model in ["MiniMax-M3", "served-plain-relay-model"] {
             let mut request: ChatCompletionRequest = serde_json::from_value(json!({
                 "model": model,
                 "messages": [{"role": "user", "content": "hello"}],
@@ -6585,9 +6588,8 @@ mod tests {
                 .route_chat(None, &tenant, request, crate::worker::UNKNOWN_MODEL_ID)
                 .await;
             assert_eq!(response.status(), StatusCode::OK, "{model}");
-            assert_eq!(
-                response.headers().contains_key(CONTENT_LENGTH),
-                keeps_length,
+            assert!(
+                !response.headers().contains_key(CONTENT_LENGTH),
                 "{model}: the Content-Length of a sized upstream answer"
             );
             let bytes = http_body_util::BodyExt::collect(response.into_body())
@@ -6606,6 +6608,106 @@ mod tests {
                 .collect();
             assert_eq!(text, "Hello", "{model}: the text is whole");
         }
+    }
+
+    /// Whether `bytes` hold a whole HTTP/1 request: the head and as many
+    /// body bytes as its `Content-Length` declares.
+    fn request_complete(bytes: &[u8]) -> bool {
+        let Some(head_end) = bytes.windows(4).position(|w| w == b"\r\n\r\n") else {
+            return false;
+        };
+        let head = String::from_utf8_lossy(&bytes[..head_end]);
+        let length = head
+            .lines()
+            .find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                name.trim()
+                    .eq_ignore_ascii_case("content-length")
+                    .then(|| value.trim().parse::<usize>().ok())?
+            })
+            .unwrap_or(0);
+        bytes.len() >= head_end + 4 + length
+    }
+
+    /// A worker that answers one request with a sized SSE head (the
+    /// `Content-Length` of the whole `body`) and closes the connection after
+    /// the first `sent` bytes of it: an upstream that knew its length and
+    /// went away mid-body.
+    #[expect(
+        clippy::disallowed_methods,
+        reason = "test stub server lives for the duration of the test process"
+    )]
+    async fn spawn_sized_sse_worker_cut_after(body: &'static str, sent: usize) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // The whole request first, so the close is a clean end of the
+            // answer and never a reset of unread request bytes.
+            let mut request = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !request_complete(&request) {
+                match sock.read(&mut buf).await {
+                    Ok(n) if n > 0 => request.extend_from_slice(&buf[..n]),
+                    _ => return,
+                }
+            }
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(&body.as_bytes()[..sent]).await;
+            let _ = sock.flush().await;
+            // The socket drops here, short of the declared length.
+        });
+        format!("http://{addr}")
+    }
+
+    /// The plain path ends a cut stream with its error event too, so a sized
+    /// upstream answer that is cut reaches the client without the upstream's
+    /// `Content-Length`: the frames that arrived, the typed error event and
+    /// `[DONE]` under no declared length the event would overrun.
+    #[tokio::test]
+    async fn a_cut_sized_stream_on_the_plain_path_ends_with_its_error_event_and_no_length() {
+        const BODY: &str = "data: {\"choices\":[{\"delta\":{\"content\":\"a\"}}]}\n\n\
+                            data: {\"choices\":[{\"delta\":{\"content\":\"b\"}}]}\n\n\
+                            data: [DONE]\n\n";
+        let first = BODY.find("\n\n").unwrap() + 2;
+        let url = spawn_sized_sse_worker_cut_after(BODY, first).await;
+        let router = streaming_router(least_load_policy(), 1024 * 1024, vec![plain_worker(&url)]);
+
+        let response = router
+            .route_typed_request(
+                None,
+                None,
+                streaming_chat_request(),
+                "/v1/chat/completions",
+                crate::worker::UNKNOWN_MODEL_ID,
+            )
+            .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert!(
+            !response.headers().contains_key(CONTENT_LENGTH),
+            "a cut stream's length is not the upstream's"
+        );
+        let bytes = http_body_util::BodyExt::collect(response.into_body())
+            .await
+            .expect("the body ends cleanly after the error event")
+            .to_bytes();
+        let body = std::str::from_utf8(&bytes).unwrap();
+        let events = sse_events(body);
+        assert_eq!(events.len(), 3, "{body}");
+        assert_eq!(events[0], BODY[..first].trim_end());
+        let error: Value = serde_json::from_str(events[1].strip_prefix("data: ").unwrap())
+            .expect("the error event is a frame of its own");
+        assert_eq!(error["error"]["type"], "stream_error", "{body}");
+        assert_eq!(events[2], "data: [DONE]");
     }
 }
 
