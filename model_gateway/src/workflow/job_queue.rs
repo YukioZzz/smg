@@ -5,7 +5,10 @@
 
 use std::{
     collections::HashMap,
-    sync::{Arc, Weak},
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc, Weak,
+    },
     time::{Duration, SystemTime},
 };
 
@@ -167,10 +170,39 @@ pub struct JobQueue {
     /// The waiters of [`Self::submit_and_wait`], by job key: a job's outcome
     /// is handed to its waiter when the job ends.
     outcomes: Outcomes,
+    /// The next waiter's id: what tells a caller's waiter from a later one
+    /// under the same key.
+    next_waiter_id: AtomicU64,
+}
+
+/// The caller waiting on a job's outcome under the job's key, one per key
+/// at a time; `id` is the caller's own, so a caller leaving takes its own
+/// entry alone.
+struct Waiter {
+    id: u64,
+    sender: oneshot::Sender<Result<String, String>>,
 }
 
 /// The waiters for a job's outcome, by job key.
-type Outcomes = Arc<DashMap<String, oneshot::Sender<Result<String, String>>>>;
+type Outcomes = Arc<DashMap<String, Waiter>>;
+
+/// Removes the caller's waiter when the caller leaves
+/// [`JobQueue::submit_and_wait`] by any path: a submit refused, a wait
+/// cancelled while the queue is full, a timeout, or the outcome delivered
+/// (which removed it already). The entry goes only while it is still this
+/// caller's, so a later waiter under the same key stays.
+struct WaiterSlot {
+    outcomes: Outcomes,
+    key: String,
+    id: u64,
+}
+
+impl Drop for WaiterSlot {
+    fn drop(&mut self) {
+        self.outcomes
+            .remove_if(&self.key, |_, waiter| waiter.id == self.id);
+    }
+}
 
 /// Why [`JobQueue::submit_and_wait`] returned no success message.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -181,6 +213,9 @@ pub enum JobOutcomeError {
     Failed(String),
     /// The job did not end within the wait; it keeps running.
     TimedOut(Duration),
+    /// A caller is waiting on a job under this key already: the job runs
+    /// once and its outcome goes to that caller.
+    InFlight(String),
 }
 
 impl std::fmt::Display for JobOutcomeError {
@@ -189,6 +224,7 @@ impl std::fmt::Display for JobOutcomeError {
             Self::NotQueued(reason) => write!(f, "Failed to submit job: {reason}"),
             Self::Failed(reason) => f.write_str(reason),
             Self::TimedOut(wait) => write!(f, "Job timeout after {}s", wait.as_secs()),
+            Self::InFlight(key) => write!(f, "A job for {key} is in flight; wait for its outcome"),
         }
     }
 }
@@ -226,6 +262,7 @@ impl JobQueue {
             status_map: status_map.clone(),
             concurrency_limit: concurrency_limit.clone(),
             outcomes: outcomes.clone(),
+            next_waiter_id: AtomicU64::new(1),
         });
 
         // Single dispatcher task
@@ -434,9 +471,22 @@ impl JobQueue {
     ) -> Result<String, JobOutcomeError> {
         let key = job.worker_url().to_string();
         let (tx, rx) = oneshot::channel();
-        self.outcomes.insert(key.clone(), tx);
+        let id = self.next_waiter_id.fetch_add(1, Ordering::Relaxed);
+        // One waiter per key: a second caller for a job in flight is refused,
+        // not handed the first caller's outcome (and the first its loss).
+        match self.outcomes.entry(key.clone()) {
+            Entry::Occupied(_) => return Err(JobOutcomeError::InFlight(key)),
+            Entry::Vacant(entry) => {
+                entry.insert(Waiter { id, sender: tx });
+            }
+        }
+        // The waiter leaves with the caller, whichever way the caller leaves.
+        let _slot = WaiterSlot {
+            outcomes: Arc::clone(&self.outcomes),
+            key,
+            id,
+        };
         if let Err(reason) = self.submit(job).await {
-            self.outcomes.remove(&key);
             return Err(JobOutcomeError::NotQueued(reason));
         }
         match tokio::time::timeout(timeout, rx).await {
@@ -445,10 +495,7 @@ impl JobQueue {
             Ok(Err(_)) => Err(JobOutcomeError::Failed(
                 "the job ended without an outcome".to_string(),
             )),
-            Err(_) => {
-                self.outcomes.remove(&key);
-                Err(JobOutcomeError::TimedOut(timeout))
-            }
+            Err(_) => Err(JobOutcomeError::TimedOut(timeout)),
         }
     }
 
@@ -456,7 +503,7 @@ impl JobQueue {
     /// a waiter that gave up (its receiver dropped) is a no-op.
     fn deliver_outcome(outcomes: &Outcomes, key: &str, outcome: Result<String, String>) {
         if let Some((_, waiter)) = outcomes.remove(key) {
-            let _ = waiter.send(outcome);
+            let _ = waiter.sender.send(outcome);
         }
     }
 
@@ -1227,13 +1274,99 @@ mod tests {
         }
     }
 
+    /// A caller's waiter leaves with the caller: the slot removes the entry
+    /// under its key while the entry is still this caller's, and leaves a
+    /// later caller's waiter under the same key alone.
+    #[test]
+    fn a_waiter_slot_removes_its_own_waiter_alone() {
+        let outcomes: Outcomes = Arc::new(DashMap::new());
+        let (first, _first_rx) = oneshot::channel();
+        outcomes.insert(
+            "job-1".to_string(),
+            Waiter {
+                id: 1,
+                sender: first,
+            },
+        );
+        drop(WaiterSlot {
+            outcomes: Arc::clone(&outcomes),
+            key: "job-1".to_string(),
+            id: 1,
+        });
+        assert!(outcomes.is_empty(), "the caller's own waiter goes with it");
+
+        let (later, _later_rx) = oneshot::channel();
+        outcomes.insert(
+            "job-1".to_string(),
+            Waiter {
+                id: 2,
+                sender: later,
+            },
+        );
+        drop(WaiterSlot {
+            outcomes: Arc::clone(&outcomes),
+            key: "job-1".to_string(),
+            id: 1,
+        });
+        assert_eq!(
+            outcomes.get("job-1").map(|waiter| waiter.id),
+            Some(2),
+            "a later waiter under the key stays"
+        );
+    }
+
+    /// A second caller for a job in flight is refused and the first keeps
+    /// its waiter, so the outcome reaches the caller that submitted the job.
+    #[tokio::test]
+    async fn a_second_waiter_under_a_held_key_is_refused_and_the_first_kept() {
+        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        let key = "http://worker:8000".to_string();
+        let (first, first_rx) = oneshot::channel();
+        queue.outcomes.insert(
+            key.clone(),
+            Waiter {
+                id: 1,
+                sender: first,
+            },
+        );
+        let second = queue
+            .submit_and_wait(
+                Job::RefreshWorkerLabels { url: key.clone() },
+                Duration::from_secs(1),
+            )
+            .await;
+        assert_eq!(second, Err(JobOutcomeError::InFlight(key.clone())));
+        assert_eq!(queue.outcomes.get(&key).map(|waiter| waiter.id), Some(1));
+        JobQueue::deliver_outcome(&queue.outcomes, &key, Ok("done".to_string()));
+        assert!(matches!(first_rx.await, Ok(Ok(ref message)) if message == "done"));
+    }
+
+    /// A submit the queue refuses leaves no waiter behind.
+    #[tokio::test]
+    async fn a_refused_submit_leaves_no_waiter() {
+        let queue = JobQueue::new(JobQueueConfig::default(), Weak::new());
+        let refused = queue
+            .submit_and_wait(
+                Job::RefreshWorkerLabels {
+                    url: "http://worker:8000".to_string(),
+                },
+                Duration::from_secs(1),
+            )
+            .await;
+        assert!(matches!(refused, Err(JobOutcomeError::NotQueued(_))));
+        assert!(
+            queue.outcomes.is_empty(),
+            "a refused submit leaves no waiter"
+        );
+    }
+
     /// A finished job's outcome reaches the waiter under its key once, and
     /// the waiter is gone; a key without a waiter is a no-op.
     #[tokio::test]
     async fn an_outcome_reaches_its_waiter_once() {
         let outcomes: Outcomes = Arc::new(DashMap::new());
         let (tx, rx) = oneshot::channel();
-        outcomes.insert("job-1".to_string(), tx);
+        outcomes.insert("job-1".to_string(), Waiter { id: 1, sender: tx });
         JobQueue::deliver_outcome(&outcomes, "job-2", Ok("stray".to_string()));
         JobQueue::deliver_outcome(&outcomes, "job-1", Ok("done".to_string()));
         assert!(matches!(rx.await, Ok(Ok(ref message)) if message == "done"));
